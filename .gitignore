@@ -1,0 +1,16 @@
+/mboard-node
+/bin/
+/dist/
+/coverage.out
+/agent.json
+/config.json
+/sing-box.json
+/state.json
+/data/
+/spool/
+*.key
+*.pem
+*.crt
+.env
+.env.*
+*.log

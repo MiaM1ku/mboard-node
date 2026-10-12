@@ -1,0 +1,12 @@
+{
+  "panel_url": "https://panel.example.com",
+  "token": "REPLACE_WITH_ONE_TIME_MACHINE_TOKEN",
+  "config_path": "/etc/mboard-node/sing-box.json",
+  "core_binary": "/usr/local/bin/sing-box",
+  "data_dir": "/var/lib/mboard-node",
+  "interval": "30s",
+  "request_timeout": "15s",
+  "tls_ca_path": "",
+  "tls_cert_path": "",
+  "tls_key_path": ""
+}
