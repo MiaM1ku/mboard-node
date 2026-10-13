@@ -23,7 +23,36 @@ const maxJournalBytes = 32 << 20
 const defaultSpoolLimit int64 = 256 << 20
 
 var ErrTelemetryDisabled = errors.New("native config has no enabled per-user V2Ray telemetry")
-var canonicalLabel = regexp.MustCompile(`^mb:u:([1-9][0-9]*):n:([1-9][0-9]*)(?::p:.+)?$`)
+var canonicalLabel = regexp.MustCompile(`^mb:u:([1-9][0-9]*):n:([1-9][0-9]*)(?::p:(.+))?$`)
+
+// Only an explicit, matching accounting row can supply profile identity from a
+// canonical suffix. Unmapped canonical stats names retain legacy accounting.
+func mappedTrafficLabel(label TrafficLabel) (TrafficLabel, error) {
+	if !validProfileID(label.ProfileID) {
+		return label, errors.New("traffic label has invalid profile_id")
+	}
+	parts := canonicalLabel.FindStringSubmatch(label.Label)
+	if parts == nil {
+		return label, nil
+	}
+	uid, e1 := strconv.ParseInt(parts[1], 10, 64)
+	nid, e2 := strconv.ParseInt(parts[2], 10, 64)
+	if e1 != nil || e2 != nil || uid != label.UserID || nid != label.NodeID {
+		return label, errors.New("canonical traffic label IDs disagree with mapping")
+	}
+	profile := parts[3]
+	if profile == "0" {
+		profile = ""
+	}
+	if !validProfileID(profile) {
+		return label, errors.New("canonical traffic label has invalid profile suffix")
+	}
+	if label.ProfileID != "" && label.ProfileID != profile {
+		return label, errors.New("canonical traffic label profile disagrees with mapping")
+	}
+	label.ProfileID = profile
+	return label, nil
+}
 
 type TelemetrySpec struct {
 	Address string
@@ -64,11 +93,18 @@ func telemetrySpec(raw []byte, labels []TrafficLabel) (TelemetrySpec, error) {
 	}
 	supplied := map[string]TrafficLabel{}
 	for _, label := range labels {
+		if !validProfileID(label.ProfileID) {
+			return spec, errors.New("traffic label has invalid profile_id")
+		}
 		if label.Label == "" || len(label.Label) > 512 || strings.ContainsRune(label.Label, 0) || label.UserID <= 0 || label.NodeID <= 0 || label.UserID > MaxSafeInteger || label.NodeID > MaxSafeInteger {
 			return spec, errors.New("traffic label requires an opaque 1-512 byte label and safe positive user_id/node_id")
 		}
 		if _, found := supplied[label.Label]; found {
 			return spec, errors.New("duplicate traffic label")
+		}
+		label, err = mappedTrafficLabel(label)
+		if err != nil {
+			return spec, err
 		}
 		supplied[label.Label] = label
 	}
@@ -253,6 +289,11 @@ func (c *Collector) poll(ctx context.Context, spec TelemetrySpec, generation str
 		}
 		c.Ready.Store(err == nil)
 	}()
+	for _, label := range spec.Labels {
+		if !validProfileID(label.ProfileID) {
+			return errors.New("traffic label has invalid profile_id")
+		}
+	}
 	j, err := c.load()
 	if err != nil {
 		return err
@@ -291,7 +332,10 @@ func (c *Collector) poll(ctx context.Context, spec TelemetrySpec, generation str
 	if final {
 		next.Pending = j.Pending
 	}
-	type key struct{ user, node int64 }
+	type key struct {
+		user, node int64
+		profile    string
+	}
 	aggregates := map[key]Record{}
 	seen := map[string]bool{}
 	for _, counter := range values {
@@ -327,10 +371,11 @@ func (c *Collector) poll(ctx context.Context, spec TelemetrySpec, generation str
 			delta = counter.Value
 		}
 		next.Cursors[counter.Name] = counter.Value
-		k := key{label.UserID, label.NodeID}
+		k := key{label.UserID, label.NodeID, label.ProfileID}
 		record := aggregates[k]
 		record.UserID = k.user
 		record.NodeID = k.node
+		record.ProfileID = k.profile
 		if upload {
 			if delta > MaxSafeInteger-record.UploadBytes {
 				return errors.New("unsafe aggregated upload delta")
@@ -368,6 +413,9 @@ func (c *Collector) poll(ctx context.Context, spec TelemetrySpec, generation str
 	}
 	sort.Slice(records, func(i, j int) bool {
 		if records[i].UserID == records[j].UserID {
+			if records[i].NodeID == records[j].NodeID {
+				return records[i].ProfileID < records[j].ProfileID
+			}
 			return records[i].NodeID < records[j].NodeID
 		}
 		return records[i].UserID < records[j].UserID

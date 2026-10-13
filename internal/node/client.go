@@ -20,9 +20,10 @@ type Client struct {
 	origin, token string
 }
 type TrafficLabel struct {
-	Label  string `json:"label"`
-	UserID int64  `json:"user_id"`
-	NodeID int64  `json:"node_id"`
+	Label     string `json:"label"`
+	UserID    int64  `json:"user_id"`
+	NodeID    int64  `json:"node_id"`
+	ProfileID string `json:"profile_id,omitempty"`
 }
 
 // SharedConfig keeps the complete native core JSON separate from accounting metadata.

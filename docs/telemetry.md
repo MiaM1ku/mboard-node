@@ -1,5 +1,13 @@
 # Automatic telemetry contract and production deployment
 
+## Profile accounting rollout (agent 0.2.1)
+
+Deploy the backend's optional `profile_id` traffic-record validation, authorization and idempotent accounting first, then upgrade agents to 0.2.1. Keep the existing canonical `traffic_labels` rows, native config and revision unchanged during this upgrade: a trusted row named `mb:u:<uid>:n:<node>:p:<profile>` already carries the profile identity, so adding the optional metadata field is not required. Each accepted newer config revision restarts the core and disconnects active connections; avoid a redundant metadata-only revision before the agent upgrade. The binary upgrade itself has the existing graceful-final-sample and disconnect boundary described below.
+
+Profile partitions apply only to traffic sampled by the new agent. Previously merged records and queued 0.2.0 batches cannot be split back into profiles. The new agent reads existing journals and spools without a format migration, keeps their immutable batch IDs and empty profile dimension, and sends them with the exact legacy JSON shape. Don't rewrite or delete queued batches or the backend's retry ledger.
+
+No new agent config setting is needed. `profile_id` is optional accounting metadata and an optional traffic-record field, not a core option. Empty/default profile fields are omitted from JSON. The reserved canonical suffix `p:0` means the default profile and must not be sent as `profile_id:"0"`.
+
 ## Compatible core
 
 Use sing-box **v1.14.3**, upstream commit `7054cac5124465ffdb145870d7c01885566711b1`, with `with_v2ray_api`. This tag is absent from the verified stock Linux release. The agent remains independent: it imports official gRPC/protobuf, not sing-box or legacy-node modules. V2Ray stats in v1.12 have the same wire/cumulative semantics, but the migration's full native JSON should be validated against pinned v1.14.3 because feature/config support differs.
@@ -39,19 +47,32 @@ The existing full GET `/api/node/v1/config` remains:
           "listen": "127.0.0.1:19090",
           "stats": {
             "enabled": true,
-            "users": ["arbitrary-source-alias", "mb:u:7:n:21:p:reality"]
+            "users": ["arbitrary-source-alias", "mb:u:7:n:21:p:0", "mb:u:7:n:21:p:d931ed25-42a5-4669-b518-c30c14d0b471"]
           }
         }
       }
     },
     "traffic_labels": [
-      {"label": "arbitrary-source-alias", "user_id": 7, "node_id": 21}
+      {"label": "arbitrary-source-alias", "user_id": 7, "node_id": 21, "profile_id": "f4663c5b-5591-4d7a-bec3-f4149068fb58"},
+      {"label": "mb:u:7:n:21:p:0", "user_id": 7, "node_id": 21},
+      {"label": "mb:u:7:n:21:p:d931ed25-42a5-4669-b518-c30c14d0b471", "user_id": 7, "node_id": 21}
     ]
   }
 }
 ```
 
-`config` is the FULL native core object, not the simplified illustration above. Unknown native fields and unknown envelope additions remain supported. `traffic_labels` is accounting metadata outside native JSON. Each `stats.users` entry must have either an exact opaque mapping or canonical `mb:u:<positive uid>:n:<positive entry id>[:p:<nonempty profile>]`. Explicit mapping wins, allowing legacy aliases without any runtime old-prefix rule. The entry node ID is the subscribed logical entry, including parent/alias routing semantics, not the outbound target node. Preserve full labels, including embedded delimiters, by exact equality. One label cannot represent two entry nodes: the core aggregates per username across inbounds, so different entries require distinct authenticated names.
+`config` is the FULL native core object, not the simplified illustration above. Unknown native fields and unknown envelope additions remain supported. `traffic_labels` is accounting metadata outside native JSON. Each `stats.users` entry must have either an exact opaque mapping or canonical `mb:u:<positive uid>:n:<positive entry id>[:p:<nonempty suffix>]`. Explicit mappings allow legacy aliases without any runtime old-prefix rule. The entry node ID is the subscribed logical entry, including parent/alias routing semantics, not the outbound target node. Preserve full labels, including embedded delimiters, by exact equality. One label cannot represent two entry nodes: the core aggregates per username across inbounds, so different entries require distinct authenticated names.
+
+An explicit mapping may add `profile_id`, a case-sensitive 1..64-character string containing only ASCII letters, digits or hyphens (`[A-Za-z0-9-]{1,64}`), typically the backend's stable profile UUID. Empty means legacy/default and is omitted. The value `"0"` is reserved and rejected. For an explicit canonical row, the UID/node in the name must match the row, and the suffix supplies the profile when the optional field is absent. `p:0` or no suffix supplies an empty profile. A nonempty explicit field must agree with the canonical suffix. Invalid profile suffixes and conflicting IDs/profile fields fail before config application. Opaque aliases take only their explicit `profile_id`; without it, they keep empty/default accounting. **A canonical stats name without an explicit `traffic_labels` row still supplies only UID/node, never profile identity.** No profile is guessed from an unmapped core counter.
+
+POST `/api/node/v1/traffic` keeps `batch_id` and `records`. Each record keeps required `user_id`, `node_id`, `upload_bytes`, `download_bytes` and adds optional `profile_id`. Separate profiles for the same user/node must remain separate backend partitions and must not multiply global totals. Example records:
+
+```json
+[
+  {"user_id":7,"node_id":21,"upload_bytes":11,"download_bytes":13},
+  {"user_id":7,"node_id":21,"upload_bytes":17,"download_bytes":19,"profile_id":"d931ed25-42a5-4669-b518-c30c14d0b471"}
+]
+```
 
 The mapping must include every noncanonical name. Duplicate names, missing mappings, extra mappings absent from stats.users, unsafe IDs and non-loopback API addresses are rejected before stopping the previous core. Maximum: 10,000 stats users, 512 bytes per label, IDs 1..9007199254740991. The API must use a literal loopback IP and valid port, e.g. `127.0.0.1:19090` or `[::1]:19090`. It has no authentication: restrict local user access. Do not let any second collector issue `reset:true`.
 
@@ -63,7 +84,7 @@ All changes to native JSON OR accounting mappings require a higher revision. Map
 
 The agent invokes `/v2ray.core.app.stats.command.StatsService/QueryStats` using official protobuf wire messages and **reset:false**. Empty patterns enumerate counters exactly once. sing-box's generated client namespace differs from the rewritten V2Ray-compatible server name; this agent intentionally doesn't import that client. Never use deprecated `pattern` field1 (ignored in v1.14.3) or overlapping patterns (can duplicate rows).
 
-Only `user>>>FULL-LABEL>>>traffic>>>uplink` and `downlink` counters are billed. Inbound/outbound totals are ignored, preventing subset double counting. Counters are process-local cumulative atomics, remain after short TCP/UDP closes, and are read independently (not a simultaneous snapshot). Each sample aggregates deltas across profile labels into `(user_id,node_id)`. A zero/empty sample creates no fake zero traffic records. Missing rows retain their previous cursor, not a zero baseline.
+Only `user>>>FULL-LABEL>>>traffic>>>uplink` and `downlink` counters are billed. Inbound/outbound totals are ignored, preventing subset double counting. Counters are process-local cumulative atomics, remain after short TCP/UDP closes, and are read independently (not a simultaneous snapshot). Each sample aggregates deltas into `(user_id,node_id,profile_id)`, merging multiple labels only when all three dimensions match. Counter cursors remain keyed by the exact core counter name, not by profile. A trusted mapping change within the same core generation attributes only later deltas to the new profile and never resets the cursor or changes already pending records. A zero/empty sample creates no fake zero traffic records. Missing rows retain their previous cursor, not a zero baseline.
 
 1. Recover any committed pending batches before reading more counters, including while the core is down.
 2. Read cumulative counters with a bounded gRPC deadline.
@@ -88,7 +109,7 @@ Defaults: telemetry poll `5s`, local deadline `5s`, heartbeat/config `30s`, HTTP
 
 ## What is measured and what isn't
 
-Pinned source probes used real loopback TCP/UDP around upstream counter wrappers. After short closed TCP, three nonreset reads kept uplink6/downlink4 bytes. After short closed UDP, three kept uplink6/downlink8. An opt-in test against the actual parent-built tagged v1.14.3 core also passed under `-race`: a short authenticated SOCKS TCP connection sent 14 upload/16 download payload bytes, closed before polling, produced exactly one durable user7/node21 batch across four nonreset polls, reached HTTP ACK, and wasn't billed again after ACK. Run `MBOARD_TEST_CORE_BINARY=/tmp/mboard-core-build/sing-box go test -race ./internal/node -run TestLiveCoreClosedAuthenticatedTCPAccounting -count=1 -v`. This proves the actual core's auth→counter→journal→HTTP path, not production Reality/Vision, SS2022 two-user TCP/UDP, Trojan UDP or AnyTLS UoT acceptance. The independent agent's mock-gRPC and HTTP tests cover wire path/reset flag, deltas, mapping, ACK replay and crash journal recovery. They do not prove production TLS credentials, all native routes, NIC accounting or live host connectivity.
+Pinned source probes used real loopback TCP/UDP around upstream counter wrappers. After short closed TCP, three nonreset reads kept uplink6/downlink4 bytes. After short closed UDP, three kept uplink6/downlink8. An opt-in test against the actual parent-built tagged v1.14.3 core also passed under `-race`: a short authenticated SOCKS TCP connection sent 14 upload/16 download payload bytes, closed before polling, produced exactly one durable user7/node21 batch across four nonreset polls, reached HTTP ACK, and wasn't billed again after ACK. Run `MBOARD_TEST_CORE_BINARY=/tmp/mboard-core-build/sing-box go test -race ./internal/node -run TestLiveCoreClosedAuthenticatedTCPAccounting -count=1 -v`. This proves the actual core's auth→counter→journal→HTTP path, not production Reality/Vision, SS2022 two-user TCP/UDP, Trojan UDP or AnyTLS UoT acceptance. The independent agent's mock-gRPC and HTTP tests cover wire path/reset flag, deltas, mapping, ACK replay and crash journal recovery. The 0.2.1 opt-in `TestLiveCoreClosedTCPProfilePartitions` also passes with the same actual core under `-race`: two short authenticated TCP users sharing user7/node21 produce independent profile records of 16 upload/18 download bytes each across three nonreset polls. Enabling inbound/outbound stats in that fixture leaves the combined billed totals at 32 upload/36 download bytes, so global counters are not billed a second time. Its mappings omit `profile_id`, matching the backend-first rollout without a metadata revision. Profile regression tests cover empty/default JSON, 64-character IDs, rejected reserved/invalid IDs, trusted canonical mismatches, old spool/journal recovery, immutable pending profiles through a mapping change and unchanged HTTP retry payloads. These tests do not prove production TLS credentials, all native routes, NIC accounting or live host connectivity.
 
 Authenticated routed payload is counted. DNS `hijack-dns` handling returns before router trackers, so locally hijacked DNS bytes are not billed. Authentication failures, handshake overhead, Reality camouflage/fallback traffic have no attributed user counter. AnyTLS multiplexed streams/UoT keep authenticated user context. TUN RoutedFlow counters measure raw packet lengths, unlike proxy payload bytes: don't mix them as the same billing unit. Closed counters persist for process lifetime, not across core restarts.
 

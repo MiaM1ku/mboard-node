@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const Version = "0.2.0"
+const Version = "0.2.1"
 const MaxBody = 1 << 20
 const MaxSafeInteger int64 = 9007199254740991
 
@@ -161,10 +161,28 @@ func decodeStrict(r io.Reader, v any) error {
 }
 
 type Record struct {
-	UserID        int64 `json:"user_id"`
-	NodeID        int64 `json:"node_id"`
-	UploadBytes   int64 `json:"upload_bytes"`
-	DownloadBytes int64 `json:"download_bytes"`
+	UserID        int64  `json:"user_id"`
+	NodeID        int64  `json:"node_id"`
+	UploadBytes   int64  `json:"upload_bytes"`
+	DownloadBytes int64  `json:"download_bytes"`
+	ProfileID     string `json:"profile_id,omitempty"`
+}
+
+// Empty identifies legacy/default traffic. "0" is the reserved default label
+// suffix, not a profile ID. Profile identity comes only from explicit metadata.
+func validProfileID(id string) bool {
+	if id == "" {
+		return true
+	}
+	if id == "0" || len(id) > 64 {
+		return false
+	}
+	for _, c := range id {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Record) UnmarshalJSON(raw []byte) error {
@@ -173,6 +191,7 @@ func (r *Record) UnmarshalJSON(raw []byte) error {
 		NodeID        *int64 `json:"node_id"`
 		UploadBytes   *int64 `json:"upload_bytes"`
 		DownloadBytes *int64 `json:"download_bytes"`
+		ProfileID     string `json:"profile_id,omitempty"`
 	}
 	if err := decodeStrict(strings.NewReader(string(raw)), &input); err != nil {
 		return err
@@ -180,7 +199,10 @@ func (r *Record) UnmarshalJSON(raw []byte) error {
 	if input.UserID == nil || input.NodeID == nil || input.UploadBytes == nil || input.DownloadBytes == nil {
 		return errors.New("record requires explicit user_id, node_id, upload_bytes and download_bytes")
 	}
-	*r = Record{UserID: *input.UserID, NodeID: *input.NodeID, UploadBytes: *input.UploadBytes, DownloadBytes: *input.DownloadBytes}
+	if !validProfileID(input.ProfileID) {
+		return errors.New("profile_id must be empty or 1-64 letters, digits or hyphens, excluding reserved 0")
+	}
+	*r = Record{UserID: *input.UserID, NodeID: *input.NodeID, UploadBytes: *input.UploadBytes, DownloadBytes: *input.DownloadBytes, ProfileID: input.ProfileID}
 	return nil
 }
 
@@ -202,6 +224,9 @@ func (b Batch) Validate() error {
 		return errors.New("records must contain 1-10000 entries")
 	}
 	for i, r := range b.Records {
+		if !validProfileID(r.ProfileID) {
+			return errors.New("record " + strconv.Itoa(i) + " has invalid profile_id")
+		}
 		if r.UserID <= 0 || r.NodeID <= 0 || r.UserID > MaxSafeInteger || r.NodeID > MaxSafeInteger || r.UploadBytes < 0 || r.DownloadBytes < 0 || r.UploadBytes > MaxSafeInteger || r.DownloadBytes > MaxSafeInteger {
 			return errors.New("record " + strconv.Itoa(i) + " has invalid IDs or unsafe byte counters")
 		}
