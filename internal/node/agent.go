@@ -88,6 +88,18 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 	if err != nil {
 		logger.Printf("local config state: %v", err)
 	}
+	spool := Spool{Dir: filepath.Join(c.DataDir, "spool")}
+	telemetryInterval, _ := time.ParseDuration(c.TelemetryInterval)
+	if telemetryInterval == 0 {
+		telemetryInterval = 5 * time.Second
+	}
+	telemetryTimeout, _ := time.ParseDuration(c.TelemetryTimeout)
+	if telemetryTimeout == 0 {
+		telemetryTimeout = 5 * time.Second
+	}
+	collector := &Collector{Path: filepath.Join(c.DataDir, "collector.json"), Spool: spool, Reader: GRPCStats{}, Timeout: telemetryTimeout, SpoolLimit: c.TelemetrySpoolMaxBytes}
+	manager.BeforeRestart = collector.Poll
+	manager.BeforeRollback = collector.Final
 	interval, _ := time.ParseDuration(c.Interval)
 	started := time.Now()
 	var wg sync.WaitGroup
@@ -96,7 +108,8 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 		go func() { defer wg.Done(); loop(ctx, frequency, name, logger, fn) }()
 	}
 	start("heartbeat", interval, func(ctx context.Context) error {
-		_, err := client.Heartbeat(ctx, Heartbeat{Version: Version, UptimeSeconds: int64(time.Since(started).Seconds()), ConfigRevision: manager.Revision()})
+		revision, coreReady, telemetryReady := manager.Status(collector)
+		_, err := client.Heartbeat(ctx, Heartbeat{Version: Version, UptimeSeconds: int64(time.Since(started).Seconds()), ConfigRevision: revision, CoreReady: &coreReady, TelemetryReady: &telemetryReady})
 		return err
 	})
 	start("config", interval, func(ctx context.Context) error {
@@ -116,10 +129,15 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 		}
 		return err
 	})
-	spool := Spool{Dir: filepath.Join(c.DataDir, "spool")}
+	start("collector", telemetryInterval, func(ctx context.Context) error { return manager.Collect(ctx, collector) })
 	start("traffic", time.Second, func(ctx context.Context) error { return spool.Flush(ctx, client) })
 	logger.Print("agent started; machine token [REDACTED]")
 	<-ctx.Done()
 	wg.Wait()
+	finalCtx, cancel := context.WithTimeout(context.Background(), telemetryTimeout+5*time.Second)
+	defer cancel()
+	if err := manager.FinalCollect(finalCtx, collector); err != nil {
+		logger.Printf("shutdown traffic drain: %v", err)
+	}
 	return core.Stop()
 }

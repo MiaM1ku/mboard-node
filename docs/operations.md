@@ -10,11 +10,12 @@ Default local layout:
 /etc/mboard-node/tls/<node_id>.crt          inbound server full certificate chain
 /etc/mboard-node/tls/<node_id>.key          inbound private key (0600)
 /var/lib/mboard-node/state.json             applied revision + SHA-256 config digest (0600)
+/var/lib/mboard-node/collector.json         cursors + pending immutable batch journal (0600)
 /var/lib/mboard-node/agent.lock             exclusive daemon lock (0600)
 /var/lib/mboard-node/spool/<batch_id>.json   pending real traffic deltas (0600)
 ```
 
-Use an administrator-controlled account. Keep config/data directories mode `0700` and on a local filesystem that supports atomic rename, hard links, directory fsync and flock. The daemon creates missing managed directories with `0700` but does not silently change existing permissions. `ingest` can run concurrently with the daemon. Two daemons cannot share a data directory. Do not run a separate sing-box service against the same ports; this agent owns one child. Reserve sufficient disk space because accounting batches remain on disk until acknowledged. Monitor spool size and free disk space outside this agent.
+Use an administrator-controlled account. Keep config/data directories mode `0700` and on a local filesystem that supports atomic rename, hard links, directory fsync and flock. The daemon creates missing managed directories with `0700` and enforces `data_dir` mode `0700` even when it exists. `ingest` can run concurrently with the daemon, but must not duplicate automatic core accounting. Two daemons cannot share a data directory. Do not run a separate sing-box service against the same ports; this agent owns one child. Reserve sufficient disk space because accounting batches remain on disk until acknowledged. Monitor spool size and free disk space outside this agent.
 
 To install a built binary and create the directories:
 
@@ -29,7 +30,7 @@ The binary does not install sing-box. Install a release from the upstream vendor
 
 ## Provision inbound TLS
 
-mboard emits fixed inbound paths `/etc/mboard-node/tls/<node_id>.crt` and `/etc/mboard-node/tls/<node_id>.key`. Changing agent `config_path` does not rewrite them. TLS-enabled VLESS/Trojan nodes need a certificate valid for the configured `server_name`, its matching private key and the full intermediate chain. Acquire/renew with your chosen trusted certificate workflow; this agent does not issue certificates or receive private keys from the panel.
+The backend's complete native JSON references inbound TLS paths, normally under `/etc/mboard-node/tls`. Provision exactly those paths. A common layout is `<node_id>.crt` / `<node_id>.key`, but the agent doesn't rewrite arbitrary source certificate filenames. Changing agent `config_path` does not rewrite inbound TLS references. TLS-enabled VLESS/Trojan/AnyTLS nodes need a certificate valid for the configured `server_name`, its matching private key and the full intermediate chain. Acquire/renew with your chosen trusted certificate workflow; this agent does not issue certificates or receive private keys from the panel.
 
 For a node whose numeric ID is 3:
 
@@ -55,7 +56,7 @@ User=root
 ExecStart=/usr/local/bin/mboard-node run -config /etc/mboard-node/agent.json
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=45
+TimeoutStopSec=75
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -68,9 +69,9 @@ Install as `/etc/systemd/system/mboard-node.service`, then run `systemctl daemon
 
 ## Revision lifecycle and restart cost
 
-1. Heartbeat, config fetch/apply and spool delivery have separate loops. Core startup/check failures do not stop heartbeat. A heartbeat reports agent uptime and the last committed local config revision; it is not a proxy health check.
+1. Heartbeat, config fetch/apply, automatic collection and spool delivery have separate loops. Core startup/check failures do not stop heartbeat. Heartbeat keeps its three required fields and adds optional `core_ready` / `telemetry_ready`; these distinguish agent liveness from a living applied core and successful current-generation accounting. They don't prove external client connectivity.
 2. Config fetch is a full `GET /api/node/v1/config`. A higher revision is staged in the live config directory, synced, and checked with `sing-box check -c <temp>` using the fixed local binary. JSON object configuration with zero enabled inbounds is allowed. The core decides whether its contents are valid.
-3. Only after successful validation, the candidate replaces the live file by atomic rename. The old child receives SIGTERM, then is killed if it has not exited within 10 seconds. A new child starts with `run -c <live-path>`.
+3. After successful validation, the agent checkpoints old core counters before replacing the live config by atomic rename. A failed checkpoint blocks the update. The old child receives SIGTERM, then is killed if it has not exited within 10 seconds. A new child starts with `run -c <live-path>`. This still has a sample-to-stop traffic tail window; see telemetry.md.
 4. The new process must remain alive for one second. Then the agent syncs an atomic state file containing revision and digest. The identical revision/config is a no-op when the core is alive. Changed content at the same revision and backwards revisions are rejected.
 5. If startup/state persistence fails, the previous config is restored. The previous child is restarted if feasible. If this was the first apply, the candidate is removed and no core runs. A rollback can also fail (for example disk failure or the old port cannot bind); the agent logs that distinction and keeps heartbeating.
 
@@ -82,21 +83,23 @@ Config and revision metadata are two files, not one filesystem transaction. A po
 
 Successful heartbeat/config polls use `interval` (default 30 seconds). Traffic sends at most one pending batch per second. Each loop retries errors starting at one second and doubles up to five minutes, with up to 25% jitter. Loops are independent so a backlog or hung traffic endpoint does not delay heartbeat. HTTP requests and `check` commands are bounded by `request_timeout` (default 15 seconds). Persistent authentication errors also back off; replace a rotated token and restart the agent.
 
-SIGTERM or Ctrl-C cancels HTTP/check work, waits for worker loops, and stops the managed child with SIGTERM/10-second kill fallback. A rollback already in progress can take up to its 30-second recovery deadline plus child-stop time. Do not set a service shutdown timeout below 45 seconds. Pending batches remain for the next start.
+SIGTERM or Ctrl-C cancels HTTP/check work, waits for workers, and takes a final bounded journal checkpoint before stopping the child with SIGTERM/10-second kill fallback. This final checkpoint bypasses the soft spool cap and can retain pending batches without publishing them; startup recovery publishes them even if the core is down. Hard disk failure or unavailable gRPC can still prevent that sample and is logged. Linux parent-death SIGKILL prevents orphan core listeners after agent death. A rollback already in progress can take up to its 30-second recovery deadline plus child-stop time and a 15-second candidate drain. Set the service shutdown timeout to at least 75 seconds. Pending batches remain for the next start.
 
-## Counter collector requirements
+## Automatic accounting and recovery
 
-The local collector must attribute actual upload/download bytes to both a decimal user ID and a node ID. It must map sing-box inbound tags/listener identity to mboard node IDs and keep its own persistent checkpoints. It must capture final bytes for closed connections and connections that begin and end between polls; active-connection snapshots alone miss those bytes. Do not treat aggregate connection totals or a core-wide Clash `/traffic` stream as per-user billing. A suitable future integration could use a verified per-user statistics source, but this repository ships only durable ingestion and delivery.
+The agent ships an automatic local V2Ray gRPC collector. Use pinned sing-box v1.14.3 built with `with_v2ray_api`, emitted authenticated user names and the optional envelope `traffic_labels` mappings. The API reads nonreset cumulative user counters, including short closed connections, and commits cursor + immutable batch records atomically in `collector.json`. See [telemetry.md](telemetry.md) for exact config/heartbeat fields, opaque identity rules, SS2022 multiuser requirements, state bounds and unavoidable core-exit loss limits.
 
-For the verified stock sing-box v1.14.3, [Clash `/connections` source](https://github.com/SagerNet/sing-box/blob/v1.14.3/experimental/clashapi/connections.go) includes inbound type/tag but **does not expose the authenticated user**, so polling it cannot attribute bytes to mboard users. [V2Ray API stats source](https://github.com/SagerNet/sing-box/blob/v1.14.3/experimental/v2rayapi/stats.go) exposes user totals aggregated across inbounds, not per-user/per-node pairs. That API also requires a `with_v2ray_api` build, which is absent from the verified official Linux v1.14.3 binary. A working automatic integration needs an actual attribution source or a separately designed telemetry extension; merely enabling Clash does not provide accurate billing.
+Automatic collection stops admission at 256 MiB by default or 10,000 spool entries without resetting core counters. Set `telemetry_spool_max_bytes` to `33554432` (32 MiB) for tiny containers and reserve filesystem space separately. Final shutdown checkpoints bypass this soft admission limit into bounded journal storage. File enumeration is paged rather than materializing the whole backlog. Manual ingest can bypass those bounds; operate it as a separate trusted source, never the same core's counters.
 
-When the source supplies monotonically increasing totals, compute deltas per user/node from a persistent checkpoint. Handle source restart/reset without subtracting a larger previous total. Before advancing the checkpoint, persist a stable ID plus exact delta records so a crash can retry the same batch. Commit your source checkpoint only after durable ingest, keeping the ID if the CLI outcome is uncertain. The example numbers in README illustrate shape, not measured activity.
+Do not delete or hand-edit collector cursors to fix an outage: resetting a cursor while the core still lives can bill its lifetime traffic again. A malformed journal blocks collection instead of silently resetting it. Stop the service, preserve journal+spool together, and reconcile/restore from a known-good backup. Core counters after the last checkpoint disappear when that core exits, so a pending outage should be repaired before restarting if possible. Certificate renewal and every accepted config revision restart the core, disconnecting existing users.
+
+Clash snapshots are not a replacement: they lack authenticated user identity. The V2Ray API is per username, so distinct entry nodes need distinct auth names. Aliases can stay unchanged through exact `traffic_labels` mappings. Inbound-wide/outbound-wide stats are never added to user records. The backend ledger must retain machine+batch deduplication through restores.
 
 A malformed spool file blocks the delivery loop rather than silently discarding accounting data. Stop the daemon, inspect the file in a protected terminal, then repair it or move it outside `spool` into an operator-owned quarantine directory. Reconcile its counters before deleting it. Records the server rejects because their node/user grant changed also stay queued and need operator reconciliation. Neither the agent nor the contract provides historical-grant reconciliation automatically.
 
 ## Backups and troubleshooting
 
-Back up the generated config and `state.json` together, plus pending spool files and TLS keys in encrypted storage. Retain the panel's machine+batch idempotency ledger through panel restores. Losing that ledger while replaying old batches can count traffic twice. Losing spool files can lose unreported accounting.
+Back up the generated config and `state.json` together, plus `collector.json`, pending spool files and TLS keys in encrypted storage. Retain the panel's machine+batch idempotency ledger through panel restores. Losing that ledger while replaying old batches can count traffic twice. Losing spool files can lose unreported accounting.
 
 - `401`/`403`: check enabled machine and token rotation. Never paste the token into issue logs.
 - `sing-box check failed`: inspect core version, generated JSON and required TLS files locally. The old config is kept.

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -28,6 +29,7 @@ type ProcessCore struct {
 	Timeout, StartupGrace, StopGrace time.Duration
 	cmd                              *exec.Cmd
 	done                             chan struct{}
+	counterGeneration                string
 }
 
 func (p *ProcessCore) Check(ctx context.Context, path string) error {
@@ -50,14 +52,21 @@ func (p *ProcessCore) Running() bool {
 		return true
 	}
 }
+func (p *ProcessCore) CounterGeneration() string { return p.counterGeneration }
 func (p *ProcessCore) Restart(ctx context.Context, path string) error {
+	id, err := NewBatchID()
+	if err != nil {
+		return err
+	}
 	if err := p.Stop(); err != nil {
 		return err
 	}
+	p.counterGeneration = id
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	cmd := exec.Command(p.Binary, "run", "-c", path)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	// No shell, no remote arguments and no unfiltered core output in agent logs.
 	if err := cmd.Start(); err != nil {
 		return errors.New("start sing-box failed")
@@ -104,8 +113,9 @@ func (p *ProcessCore) Stop() error {
 }
 
 type State struct {
-	Revision int64  `json:"revision"`
-	SHA256   string `json:"sha256"`
+	Revision      int64          `json:"revision"`
+	SHA256        string         `json:"sha256"`
+	TrafficLabels []TrafficLabel `json:"traffic_labels,omitempty"`
 }
 type Manager struct {
 	Path, StatePath string
@@ -113,6 +123,13 @@ type Manager struct {
 	state           State
 	revision        atomic.Int64
 	applied         bool
+	mu              sync.Mutex
+	generation      string
+	spec            TelemetrySpec
+	activeSHA       string
+	BeforeRestart   func(context.Context, TelemetrySpec, string) error
+	BeforeRollback  func(context.Context, TelemetrySpec, string) error
+	writeState      func(string, []byte) error
 }
 
 func digest(data []byte) string { h := sha256.Sum256(data); return hex.EncodeToString(h[:]) }
@@ -132,12 +149,73 @@ func NewManager(c Config, core Core) (*Manager, error) {
 	if err != nil || digest(cfg) != m.state.SHA256 {
 		return m, errors.New("revision state/config mismatch; refetching panel config")
 	}
+	m.spec, err = telemetrySpec(cfg, m.state.TrafficLabels)
+	if err != nil {
+		return m, err
+	}
 	m.applied = true
 	m.revision.Store(m.state.Revision)
 	return m, nil
 }
 func (m *Manager) Revision() int64 { return m.revision.Load() }
 func (m *Manager) Ensure(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ensure(ctx)
+}
+func (m *Manager) CoreReady() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.applied && m.Core.Running() && m.activeSHA == m.state.SHA256
+}
+func (m *Manager) Status(c *Collector) (int64, bool, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ready := m.applied && m.Core.Running() && m.activeSHA == m.state.SHA256
+	generation := c.readyGeneration.Load()
+	return m.revision.Load(), ready, ready && c.Ready.Load() && generation != nil && *generation == m.generation
+}
+func (m *Manager) Collect(ctx context.Context, c *Collector) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := c.Recover(); err != nil {
+		c.Ready.Store(false)
+		return err
+	}
+	if !m.applied || !m.Core.Running() {
+		c.Ready.Store(false)
+		return errors.New("managed core unavailable")
+	}
+	return c.Poll(ctx, m.spec, m.generation)
+}
+func (m *Manager) FinalCollect(ctx context.Context, c *Collector) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.applied || !m.Core.Running() {
+		return errors.New("managed core unavailable")
+	}
+	return c.Final(ctx, m.spec, m.generation)
+}
+func (m *Manager) restart(ctx context.Context, path string) error {
+	id, err := NewBatchID()
+	if err != nil {
+		return err
+	}
+	err = m.Core.Restart(ctx, path)
+	if source, ok := m.Core.(interface{ CounterGeneration() string }); ok {
+		m.generation = source.CounterGeneration()
+	} else if err == nil || !m.Core.Running() {
+		m.generation = id
+	}
+	return err
+}
+func (m *Manager) drain(ctx context.Context) error {
+	if m.BeforeRestart != nil && m.Core.Running() && m.spec.Address != "" {
+		return m.BeforeRestart(ctx, m.spec, m.generation)
+	}
+	return nil
+}
+func (m *Manager) ensure(ctx context.Context) error {
 	if m.Core.Running() {
 		return nil
 	}
@@ -147,9 +225,15 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	if err := m.Core.Check(ctx, m.Path); err != nil {
 		return err
 	}
-	return m.Core.Restart(ctx, m.Path)
+	err := m.restart(ctx, m.Path)
+	if err == nil {
+		m.activeSHA = m.state.SHA256
+	}
+	return err
 }
 func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if r.Revision < 0 || r.Revision > MaxSafeInteger {
 		return errors.New("invalid config revision")
 	}
@@ -167,15 +251,21 @@ func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
 	if err != nil || len(raw) > MaxBody {
 		return errors.New("invalid or oversized config")
 	}
+	spec, err := telemetrySpec(raw, r.TrafficLabels)
+	if err != nil {
+		return err
+	}
 	hash := digest(raw)
 	if m.applied && r.Revision < m.state.Revision {
 		return errors.New("panel configuration revision moved backwards")
 	}
 	if m.applied && r.Revision == m.state.Revision {
-		if hash != m.state.SHA256 {
-			return errors.New("panel changed config without a new revision")
+		oldLabels, _ := json.Marshal(m.spec.Labels)
+		newLabels, _ := json.Marshal(spec.Labels)
+		if hash != m.state.SHA256 || !bytes.Equal(oldLabels, newLabels) {
+			return errors.New("panel changed config or accounting mapping without a new revision")
 		}
-		return m.Ensure(ctx)
+		return m.ensure(ctx)
 	}
 	old, err := os.ReadFile(m.Path)
 	oldExists := err == nil
@@ -191,10 +281,23 @@ func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
 		return err
 	}
 	// Validation finishes before replacing the previous config or stopping core.
+	if err = m.drain(ctx); err != nil {
+		return fmt.Errorf("cannot drain traffic before config restart: %w", err)
+	}
 	if err = os.Rename(temp, m.Path); err != nil {
 		return err
 	}
+	oldSpec, oldActiveSHA := m.spec, m.activeSHA
+	candidateStarted := false
 	rollback := func(cause error) error {
+		if candidateStarted && m.BeforeRollback != nil && m.Core.Running() && spec.Address != "" {
+			drainCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			drainErr := m.BeforeRollback(drainCtx, spec, m.generation)
+			cancel()
+			if drainErr != nil {
+				return fmt.Errorf("rollback deferred because candidate traffic cannot be checkpointed: %w", drainErr)
+			}
+		}
 		var restoreErr error
 		if oldExists {
 			restoreErr = atomicWrite(m.Path, old)
@@ -214,7 +317,7 @@ func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
 		defer cancel()
 		if oldExists {
 			if e := m.Core.Check(recovery, m.Path); e == nil {
-				restoreErr = m.Core.Restart(recovery, m.Path)
+				restoreErr = m.restart(recovery, m.Path)
 			} else {
 				restoreErr = e
 			}
@@ -224,17 +327,24 @@ func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
 		if restoreErr != nil {
 			return fmt.Errorf("apply failed; previous config restored but core recovery failed: %w", cause)
 		}
+		m.spec, m.activeSHA = oldSpec, oldActiveSHA
 		return fmt.Errorf("apply failed; previous config restored: %w", cause)
 	}
 	if err = syncDir(filepath.Dir(m.Path)); err != nil {
 		return rollback(err)
 	}
-	if err = m.Core.Restart(ctx, m.Path); err != nil {
+	if err = m.restart(ctx, m.Path); err != nil {
 		return rollback(err)
 	}
-	next := State{Revision: r.Revision, SHA256: hash}
+	candidateStarted = true
+	m.spec, m.activeSHA = spec, hash
+	next := State{Revision: r.Revision, SHA256: hash, TrafficLabels: r.TrafficLabels}
 	stateRaw, _ := json.Marshal(next)
-	if err = atomicWrite(m.StatePath, stateRaw); err != nil {
+	writeState := m.writeState
+	if writeState == nil {
+		writeState = atomicWrite
+	}
+	if err = writeState(m.StatePath, stateRaw); err != nil {
 		// If rename succeeded but dir fsync failed, restore old revision metadata too.
 		var metadataErr error
 		if m.applied {
@@ -253,6 +363,7 @@ func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
 		return recovered
 	}
 	m.state = next
+	m.spec = spec
 	m.applied = true
 	m.revision.Store(next.Revision)
 	return nil

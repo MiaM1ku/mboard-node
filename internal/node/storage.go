@@ -98,6 +98,9 @@ func Lock(dir string) (*os.File, error) {
 	if err := durableMkdirAll(dir); err != nil {
 		return nil, err
 	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, err
+	}
 	f, err := os.OpenFile(filepath.Join(dir, "agent.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
@@ -169,8 +172,34 @@ func (s Spool) Enqueue(b Batch) error {
 	}
 	return s.confirm()
 }
+func firstSpoolEntry(dir string) ([]os.DirEntry, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	count := 0
+	for {
+		entries, e := f.ReadDir(128)
+		if e != nil && e != io.EOF {
+			return nil, e
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && filepath.Ext(entry.Name()) == ".json" {
+				return []os.DirEntry{entry}, nil
+			}
+			count++
+			if count >= 10000 {
+				return nil, errors.New("too many non-batch spool entries; repair directory")
+			}
+		}
+		if e == io.EOF {
+			return nil, nil
+		}
+	}
+}
 func (s Spool) Flush(ctx context.Context, c *Client) error {
-	entries, err := os.ReadDir(s.Dir)
+	entries, err := firstSpoolEntry(s.Dir)
 	if os.IsNotExist(err) {
 		return nil
 	}

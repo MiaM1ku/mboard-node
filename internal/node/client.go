@@ -19,14 +19,26 @@ type Client struct {
 	http          *http.Client
 	origin, token string
 }
-type RemoteConfig struct {
-	Revision int64           `json:"revision"`
-	Config   json.RawMessage `json:"config"`
+type TrafficLabel struct {
+	Label  string `json:"label"`
+	UserID int64  `json:"user_id"`
+	NodeID int64  `json:"node_id"`
 }
+
+// SharedConfig keeps the complete native core JSON separate from accounting metadata.
+// Unknown envelope fields are tolerated for forward-compatible panel additions.
+type SharedConfig struct {
+	Revision      int64           `json:"revision"`
+	Config        json.RawMessage `json:"config"`
+	TrafficLabels []TrafficLabel  `json:"traffic_labels,omitempty"`
+}
+type RemoteConfig = SharedConfig
 type Heartbeat struct {
 	Version        string `json:"version"`
 	UptimeSeconds  int64  `json:"uptime_seconds"`
 	ConfigRevision int64  `json:"config_revision"`
+	CoreReady      *bool  `json:"core_ready,omitempty"`
+	TelemetryReady *bool  `json:"telemetry_ready,omitempty"`
 }
 type HeartbeatReply struct {
 	ServerTime     string `json:"server_time"`
@@ -124,8 +136,9 @@ func (c *Client) Heartbeat(ctx context.Context, h Heartbeat) (HeartbeatReply, er
 }
 func (c *Client) Config(ctx context.Context) (RemoteConfig, error) {
 	var wire struct {
-		Revision *int64          `json:"revision"`
-		Config   json.RawMessage `json:"config"`
+		Revision      *int64          `json:"revision"`
+		Config        json.RawMessage `json:"config"`
+		TrafficLabels []TrafficLabel  `json:"traffic_labels"`
 	}
 	if err := c.request(ctx, http.MethodGet, "/api/node/v1/config", nil, &wire); err != nil {
 		return RemoteConfig{}, err
@@ -133,7 +146,7 @@ func (c *Client) Config(ctx context.Context) (RemoteConfig, error) {
 	if wire.Revision == nil || *wire.Revision < 0 || *wire.Revision > MaxSafeInteger {
 		return RemoteConfig{}, errors.New("invalid config revision")
 	}
-	return RemoteConfig{Revision: *wire.Revision, Config: wire.Config}, nil
+	return RemoteConfig{Revision: *wire.Revision, Config: wire.Config, TrafficLabels: wire.TrafficLabels}, nil
 }
 func (c *Client) Traffic(ctx context.Context, b Batch) error {
 	if err := b.Validate(); err != nil {

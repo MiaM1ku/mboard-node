@@ -6,6 +6,9 @@
   "data_dir": "/var/lib/mboard-node",
   "interval": "30s",
   "request_timeout": "15s",
+  "telemetry_interval": "5s",
+  "telemetry_timeout": "5s",
+  "telemetry_spool_max_bytes": 268435456,
   "tls_ca_path": "",
   "tls_cert_path": "",
   "tls_key_path": ""

@@ -13,25 +13,28 @@ import (
 	"time"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 const MaxBody = 1 << 20
 const MaxSafeInteger int64 = 9007199254740991
 
 type Config struct {
-	PanelURL       string `json:"panel_url"`
-	Token          string `json:"token"`
-	ConfigPath     string `json:"config_path"`
-	CoreBinary     string `json:"core_binary"`
-	DataDir        string `json:"data_dir"`
-	Interval       string `json:"interval"`
-	RequestTimeout string `json:"request_timeout"`
-	TLSCAPath      string `json:"tls_ca_path"`
-	TLSCertPath    string `json:"tls_cert_path"`
-	TLSKeyPath     string `json:"tls_key_path"`
+	PanelURL               string `json:"panel_url"`
+	Token                  string `json:"token"`
+	ConfigPath             string `json:"config_path"`
+	CoreBinary             string `json:"core_binary"`
+	DataDir                string `json:"data_dir"`
+	Interval               string `json:"interval"`
+	RequestTimeout         string `json:"request_timeout"`
+	TelemetryInterval      string `json:"telemetry_interval,omitempty"`
+	TelemetryTimeout       string `json:"telemetry_timeout,omitempty"`
+	TelemetrySpoolMaxBytes int64  `json:"telemetry_spool_max_bytes,omitempty"`
+	TLSCAPath              string `json:"tls_ca_path"`
+	TLSCertPath            string `json:"tls_cert_path"`
+	TLSKeyPath             string `json:"tls_key_path"`
 }
 
 func LoadConfig(path string) (Config, error) {
-	c := Config{ConfigPath: "/etc/mboard-node/sing-box.json", CoreBinary: "/usr/local/bin/sing-box", DataDir: "/var/lib/mboard-node", Interval: "30s", RequestTimeout: "15s"}
+	c := Config{ConfigPath: "/etc/mboard-node/sing-box.json", CoreBinary: "/usr/local/bin/sing-box", DataDir: "/var/lib/mboard-node", Interval: "30s", RequestTimeout: "15s", TelemetryInterval: "5s", TelemetryTimeout: "5s"}
 	f, err := os.Open(path)
 	if err != nil {
 		return c, fmt.Errorf("open agent config: %w", err)
@@ -40,11 +43,18 @@ func LoadConfig(path string) (Config, error) {
 	if err = decodeStrict(io.LimitReader(f, MaxBody+1), &c); err != nil {
 		return c, errors.New("invalid agent config JSON")
 	}
-	vars := map[string]*string{"PANEL_URL": &c.PanelURL, "TOKEN": &c.Token, "CONFIG_PATH": &c.ConfigPath, "CORE_BINARY": &c.CoreBinary, "DATA_DIR": &c.DataDir, "INTERVAL": &c.Interval, "REQUEST_TIMEOUT": &c.RequestTimeout, "TLS_CA_PATH": &c.TLSCAPath, "TLS_CERT_PATH": &c.TLSCertPath, "TLS_KEY_PATH": &c.TLSKeyPath}
+	vars := map[string]*string{"PANEL_URL": &c.PanelURL, "TOKEN": &c.Token, "CONFIG_PATH": &c.ConfigPath, "CORE_BINARY": &c.CoreBinary, "DATA_DIR": &c.DataDir, "INTERVAL": &c.Interval, "REQUEST_TIMEOUT": &c.RequestTimeout, "TELEMETRY_INTERVAL": &c.TelemetryInterval, "TELEMETRY_TIMEOUT": &c.TelemetryTimeout, "TLS_CA_PATH": &c.TLSCAPath, "TLS_CERT_PATH": &c.TLSCertPath, "TLS_KEY_PATH": &c.TLSKeyPath}
 	for key, dst := range vars {
 		if v, ok := os.LookupEnv("MBOARD_NODE_" + key); ok {
 			*dst = v
 		}
+	}
+	if value, ok := os.LookupEnv("MBOARD_NODE_TELEMETRY_SPOOL_MAX_BYTES"); ok {
+		budget, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return c, errors.New("invalid telemetry spool byte budget")
+		}
+		c.TelemetrySpoolMaxBytes = budget
 	}
 	if c.managesPath(path) {
 		return c, errors.New("agent config collides with a managed config, state, lock or spool path")
@@ -68,7 +78,7 @@ func pathIdentity(path string) string {
 
 func (c Config) managesPath(path string) bool {
 	input := pathIdentity(path)
-	for _, output := range []string{c.ConfigPath, filepath.Join(c.DataDir, "state.json"), filepath.Join(c.DataDir, "agent.lock")} {
+	for _, output := range []string{c.ConfigPath, filepath.Join(c.DataDir, "state.json"), filepath.Join(c.DataDir, "collector.json"), filepath.Join(c.DataDir, "agent.lock")} {
 		if input == pathIdentity(output) {
 			return true
 		}
@@ -90,13 +100,16 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%s must be absolute", name)
 		}
 	}
+	if pathIdentity(c.DataDir) == string(filepath.Separator) {
+		return errors.New("data_dir cannot be the filesystem root")
+	}
 	for _, protected := range []string{c.CoreBinary, c.TLSCAPath, c.TLSCertPath, c.TLSKeyPath} {
 		if protected != "" && c.managesPath(protected) {
 			return errors.New("core or TLS input collides with a managed config, state, lock or spool path")
 		}
 	}
 	live := pathIdentity(c.ConfigPath)
-	for _, output := range []string{filepath.Join(c.DataDir, "state.json"), filepath.Join(c.DataDir, "agent.lock")} {
+	for _, output := range []string{filepath.Join(c.DataDir, "state.json"), filepath.Join(c.DataDir, "collector.json"), filepath.Join(c.DataDir, "agent.lock")} {
 		if live == pathIdentity(output) {
 			return errors.New("config_path collides with agent metadata")
 		}
@@ -106,6 +119,18 @@ func (c Config) Validate() error {
 		return errors.New("config_path cannot be inside the traffic spool")
 	}
 	for name, value := range map[string]string{"interval": c.Interval, "request_timeout": c.RequestTimeout} {
+		d, e := time.ParseDuration(value)
+		if e != nil || d < time.Second || d > time.Hour {
+			return fmt.Errorf("%s must be between 1s and 1h", name)
+		}
+	}
+	if c.TelemetrySpoolMaxBytes != 0 && (c.TelemetrySpoolMaxBytes < 4<<20 || c.TelemetrySpoolMaxBytes > 16<<30) {
+		return errors.New("telemetry_spool_max_bytes must be 0 (256MiB default) or 4MiB..16GiB")
+	}
+	for name, value := range map[string]string{"telemetry_interval": c.TelemetryInterval, "telemetry_timeout": c.TelemetryTimeout} {
+		if value == "" {
+			continue
+		}
 		d, e := time.ParseDuration(value)
 		if e != nil || d < time.Second || d > time.Hour {
 			return fmt.Errorf("%s must be between 1s and 1h", name)

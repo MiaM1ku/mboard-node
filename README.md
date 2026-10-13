@@ -1,18 +1,22 @@
 # mboard-node
 
-A standalone Go machine agent for mboard's frozen v1 node protocol. Module: `mboard.dev/node`. The executable has no runtime or protocol dependency on another panel and uses only the Go standard library. Linux is the supported operating system (local `flock` and SIGTERM lifecycle).
+A standalone Go machine agent for mboard's v1 node protocol. Module: `mboard.dev/node`. The executable has no runtime or protocol dependency on another panel. The only non-standard runtime libraries are official gRPC/protobuf packages and their pinned Go dependencies. Linux is the supported operating system (local `flock`, parent-death signal and SIGTERM lifecycle).
 
-The agent authenticates with a machine Bearer token, sends heartbeats, fetches complete sing-box server configurations, validates new revisions, manages one sing-box child, and reliably forwards locally ingested real traffic deltas. It never downloads executables or runs remote shell commands. The sing-box executable is an operator-installed requirement, not bundled.
+The agent authenticates with a machine Bearer token, sends heartbeats, fetches complete native sing-box server JSON, validates revisions, manages one external sing-box child, and automatically collects per-user/per-entry-node counters. It never downloads executables or runs remote shell commands. Install the pinned compatible core separately.
 
-**Traffic collection is an integration boundary:** this agent does not invent traffic, poll fake zeros, or claim a built-in per-user sing-box collector. An external trusted local collector must produce actual per-user, per-node byte deltas, including final bytes for short/closed connections, and call `ingest`. Without that collector the panel receives heartbeats/config updates, but no traffic accounting. Stock sing-box v1.14.3 Clash snapshots lack authenticated user identity, so enabling that API alone is not an accounting integration.
+**Automatic accounting requires a core built with `with_v2ray_api`.** The verified stock v1.14.3 Linux binary lacks that tag. The panel must emit authenticated user names, enable local V2Ray user stats, and supply opaque-name mappings when names aren't canonical `mb:u:<uid>:n:<entry>[:p:<profile>]`. Closed TCP/UDP counters survive until the core exits, so connections that start and end between polls are counted. This measures routed authenticated payload bytes, not NIC totals. See [telemetry contract](docs/telemetry.md) for exact fields, durable guarantees and restart loss limits.
 
 ## Build and test
 
-Go 1.24 or newer. No package downloads are needed.
+Go 1.24 or newer for the agent. Dependencies are pinned in `go.mod`/`go.sum`. The pinned core may need a newer Go toolchain.
 
 ```sh
+/usr/local/go/bin/go mod download
 /usr/local/go/bin/go test ./...
+/usr/local/go/bin/go vet ./...
 /usr/local/go/bin/go test -race ./...
+# Optional local authenticated-TCP → gRPC → durable batch → HTTP ACK smoke:
+MBOARD_TEST_CORE_BINARY=/tmp/mboard-core-build/sing-box /usr/local/go/bin/go test -race ./internal/node -run TestLiveCoreClosedAuthenticatedTCPAccounting -count=1 -v
 /usr/local/go/bin/go build -o mboard-node ./cmd/mboard-node
 ./mboard-node version
 ```
@@ -22,8 +26,8 @@ The build output is ignored by Git. The tests use mock HTTP servers and a local 
 ## Pair with mboard
 
 1. In mboard's admin panel, create an enabled machine. Copy its one-time token into a root-readable agent config or `MBOARD_NODE_TOKEN`.
-2. Add enabled nodes and assign them to that machine. Set group grants, protocol, endpoint, ports, TLS and users in mboard. Usernames in generated inbounds are decimal user IDs.
-3. Install a compatible sing-box release as `/usr/local/bin/sing-box`. The server config comes from mboard. Confirm that version supports its generated VLESS, Trojan and Shadowsocks configuration.
+2. Add enabled nodes and assign them to that machine. Set group grants, protocol, endpoint, ports, TLS and users in mboard. Each emitted authenticated username must identify its user and entry node through `traffic_labels` or the canonical label shape. Preserve source aliases through the mapping rather than rewriting user route names.
+3. Install pinned sing-box v1.14.3 with `with_v2ray_api` and the features needed by the native config. The server config comes from mboard unchanged. Verify the installed core's tags and `check` result. See `docs/telemetry.md` for build commands.
 4. Create `/etc/mboard-node/agent.json` from `config.example.json`, then set its panel origin and machine token. Use mode `0600`; the installed binary and its parents should be owned by the administrator.
 5. Provision every inbound TLS certificate/key before starting the agent. See `docs/operations.md`.
 6. Run:
@@ -50,12 +54,17 @@ All keys are snake_case. Unknown agent keys are rejected. Paths must be absolute
 | `data_dir` | `/var/lib/mboard-node`, local state/spool/lock |
 | `interval` | `30s`, heartbeat/config successful poll interval |
 | `request_timeout` | `15s`, HTTP and core-check timeout |
+| `telemetry_interval` | `5s`, successful cumulative gRPC poll interval |
+| `telemetry_timeout` | `5s`, local gRPC deadline |
+| `telemetry_spool_max_bytes` | `268435456` (256 MiB), automatic spool admission budget; 0 uses default. Set `33554432` (32 MiB) for low-disk containers. |
 | `tls_ca_path` | Empty, or private panel CA PEM |
 | `tls_cert_path`, `tls_key_path` | Empty, or paired panel mTLS client files |
 
 Durations accept Go forms such as `15s` and `1m`, from one second to one hour. Every key can be overridden with `MBOARD_NODE_` plus its uppercase name, for example `MBOARD_NODE_PANEL_URL`, `MBOARD_NODE_TOKEN`, `MBOARD_NODE_CONFIG_PATH`, `MBOARD_NODE_CORE_BINARY`, `MBOARD_NODE_INTERVAL`, `MBOARD_NODE_TLS_CA_PATH`. The local JSON file is still required. Command `-config` selects that agent file; JSON `config_path` selects the generated sing-box file.
 
-## Ingest real traffic
+## Manual ingest (trusted integrations only)
+
+Normal operation uses the automatic gRPC collector. `ingest` remains available for separate trusted accounting sources or reconciled historical deltas. **Do not ingest the same core's traffic in parallel with automatic collection:** different batch IDs would charge the bytes twice.
 
 Feed this shape to stdin or `-file`. Omit `batch_id` to generate a cryptographically random ID; the CLI prints the durable ID after enqueue.
 
