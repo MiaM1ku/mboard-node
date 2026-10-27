@@ -1,5 +1,13 @@
 # Automatic telemetry contract and production deployment
 
+## Delivery quarantine (agent 0.2.2)
+
+0.2.2 changes only how queued traffic batches leave the node; the config, `traffic_labels` and journal formats are unchanged, so a 0.2.2 agent reads a 0.2.1 journal and spool in place. Field case that forced it: an administrator deleted users on 2026-10-15. Each node still had one last batch for those users in `spool/`, the panel answered `403 TRAFFIC_GRANT` for the whole batch, and the pre-0.2.2 loop returned without removing the file. That batch stayed at the head of the queue, the spool filled to its 10,000-batch limit, the collector stopped publishing, `telemetry_ready` went to 0, and the nodes dropped out of subscriptions while still heartbeating. Two machines were affected before it was found.
+
+0.2.2 keeps retrying anything that could succeed later (transport, `401`, `404`, `405`, `408`, `429`, `5xx`) and moves a batch the panel refuses outright (`400`, `403`, `409`, `410`, `413`, `415`, `422`) into `spool/rejected/`, logging `traffic: retired batch <id>` once. At most 64 batches are retired per pass. The spool entry limit now counts only queued `.json` batches, so the quarantine directory never consumes it.
+
+Rollout order does not matter for correctness, but upgrade nodes before the next round of user deletions: the panel cannot tell a node that its queued batch became unaccountable. A node still running 0.2.1 needs the external drain in the panel operator's runbook (replay the spool; the panel deduplicates by `batch_id`).
+
 ## Profile accounting rollout (agent 0.2.1)
 
 Deploy the backend's optional `profile_id` traffic-record validation, authorization and idempotent accounting first, then upgrade agents to 0.2.1. Keep the existing canonical `traffic_labels` rows, native config and revision unchanged during this upgrade: a trusted row named `mb:u:<uid>:n:<node>:p:<profile>` already carries the profile identity, so adding the optional metadata field is not required. Each accepted newer config revision restarts the core and disconnects active connections; avoid a redundant metadata-only revision before the agent upgrade. The binary upgrade itself has the existing graceful-final-sample and disconnect boundary described below.

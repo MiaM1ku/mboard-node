@@ -115,6 +115,57 @@ func Lock(dir string) (*os.File, error) {
 type Spool struct {
 	Dir           string
 	syncDirectory func(string) error
+	// OnReject reports a batch the panel will never accept, after it has been
+	// retired out of the delivery queue. Nil is valid and simply stays silent.
+	OnReject func(batchID string, err error)
+}
+
+// rejectedDirName holds batches retired from delivery inside the spool so they
+// stay on disk for inspection while leaving the queue. It is a directory, so
+// every spool scan skips it.
+const rejectedDirName = "rejected"
+
+// maxRejectsPerPass bounds how fast one pass may retire undeliverable batches,
+// so a queue full of them cannot starve heartbeat and config work.
+const maxRejectsPerPass = 64
+
+func (s Spool) rejectedDir() string { return filepath.Join(s.Dir, rejectedDirName) }
+
+// permanent reports whether retrying this error could ever succeed. The set is
+// an allowlist, not "any 4xx": a 404 or 405 means the panel moved or hid the
+// endpoint, which must be retried rather than used as an excuse to discard
+// queued accounting. 401 is retryable for the same reason (the machine may be
+// re-enrolled), and 408/429 are transport-level.
+func permanent(err error) bool {
+	var api *APIError
+	if !errors.As(err, &api) {
+		return false
+	}
+	switch api.Status {
+	case 400, 403, 409, 410, 413, 415, 422:
+		return true
+	}
+	return false
+}
+
+// reject retires one batch out of the delivery queue. The batch is moved rather
+// than deleted, so an operator can still read what the panel refused.
+func (s Spool) reject(name string) error {
+	dir := s.rejectedDir()
+	if err := durableMkdirAll(dir); err != nil {
+		return err
+	}
+	path := filepath.Join(s.Dir, name)
+	if err := os.Rename(path, filepath.Join(dir, name)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := s.confirm(); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 func (s Spool) confirm() error {
@@ -199,26 +250,28 @@ func firstSpoolEntry(dir string) ([]os.DirEntry, error) {
 	}
 }
 func (s Spool) Flush(ctx context.Context, c *Client) error {
-	entries, err := firstSpoolEntry(s.Dir)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	// Bound each pass so a large queue never starves heartbeat/config work.
-	count := 0
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
-			continue
+	// One delivered batch per pass keeps heartbeat and config work responsive.
+	// Undeliverable batches are retired in the same pass instead of returning,
+	// because a batch the panel will never accept must not head-of-line block
+	// the queue: that is what turned one deleted user into a stalled node.
+	for rejected := 0; ; {
+		entries, err := firstSpoolEntry(s.Dir)
+		if os.IsNotExist(err) {
+			return nil
 		}
-		if count >= 1 {
-			break
+		if err != nil {
+			return err
 		}
-		count++
+		if len(entries) == 0 {
+			return nil
+		}
+		e := entries[0]
 		path := filepath.Join(s.Dir, e.Name())
 		info, err := os.Lstat(path)
 		if err != nil {
+			if os.IsNotExist(err) {
+				continue // the collector or another pass already retired it
+			}
 			return err
 		}
 		if !info.Mode().IsRegular() || info.Size() > MaxBody {
@@ -226,29 +279,62 @@ func (s Spool) Flush(ctx context.Context, c *Client) error {
 		}
 		f, err := os.Open(path)
 		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
 			return err
 		}
 		var b Batch
 		err = decodeStrict(io.LimitReader(f, MaxBody+1), &b)
 		f.Close()
 		if err != nil {
-			return errors.New("invalid spool JSON; repair or quarantine the batch")
+			// Corrupt JSON can never be delivered either; retire it and keep the
+			// rest of the queue moving.
+			if rejectErr := s.reject(e.Name()); rejectErr != nil {
+				return rejectErr
+			}
+			if s.OnReject != nil {
+				s.OnReject(e.Name(), errors.New("invalid spool JSON; quarantined"))
+			}
+			if rejected++; rejected >= maxRejectsPerPass {
+				return nil
+			}
+			continue
 		}
 		if err = b.Validate(); err != nil {
-			return fmt.Errorf("invalid spool batch: %w", err)
+			// A batch that fails its own invariants can never be delivered.
+			if rejectErr := s.reject(e.Name()); rejectErr != nil {
+				return rejectErr
+			}
+			if s.OnReject != nil {
+				s.OnReject(e.Name(), fmt.Errorf("invalid spool batch: %w", err))
+			}
+			if rejected++; rejected >= maxRejectsPerPass {
+				return nil
+			}
+			continue
 		}
 		if b.BatchID+".json" != e.Name() {
 			return errors.New("spool batch ID does not match filename")
 		}
 		if err = c.Traffic(ctx, b); err != nil {
+			if !permanent(err) {
+				return err
+			}
+			if rejectErr := s.reject(e.Name()); rejectErr != nil {
+				return rejectErr
+			}
+			if s.OnReject != nil {
+				s.OnReject(e.Name(), err)
+			}
+			if rejected++; rejected >= maxRejectsPerPass {
+				return nil
+			}
+			continue
+		}
+		if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		if err = os.Remove(path); err != nil {
-			return err
-		}
-		if err = s.confirm(); err != nil {
-			return err
-		}
+		return s.confirm()
 	}
-	return nil
 }

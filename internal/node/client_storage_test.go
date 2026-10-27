@@ -201,7 +201,11 @@ func TestSpoolReplayAckAndConflictingIDs(t *testing.T) {
 		t.Fatalf("calls=%d counted=%d", calls, total)
 	}
 }
-func TestSpoolUnacceptedAndMalformed(t *testing.T) {
+
+// An implementation-neutral "accepted": false is a panel contract violation, not
+// a verdict about the batch, so it stays queued. Corrupt spool contents are
+// covered by TestSpoolQuarantinesCorruptBatch.
+func TestSpoolUnacceptedBatchIsRetried(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reply(w, map[string]any{"accepted": false}) }))
 	defer srv.Close()
 	cfg := testConfig(t, srv.URL)
@@ -216,11 +220,5 @@ func TestSpoolUnacceptedAndMalformed(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.Dir, "keep.json")); err != nil {
 		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(s.Dir, "bad.json"), []byte(`{"batch_id":"../escape","records":[]}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Flush(context.Background(), c); err == nil {
-		t.Fatal("malformed spool accepted")
 	}
 }

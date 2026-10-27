@@ -19,6 +19,54 @@ type Client struct {
 	http          *http.Client
 	origin, token string
 }
+
+// APIError is a non-2xx panel reply. Code carries the panel's stable
+// machine-readable reason, so a caller can tell a batch the panel will never
+// accept from one it merely could not take right now.
+type APIError struct {
+	Status int
+	Code   string
+}
+
+func (e *APIError) Error() string {
+	if e.Code == "" {
+		return fmt.Sprintf("panel returned HTTP %d", e.Status)
+	}
+	return fmt.Sprintf("panel returned HTTP %d (%s)", e.Status, e.Code)
+}
+
+// stableCode accepts only the panel's error.code shape, never free text.
+func stableCode(value string) bool {
+	if value == "" || len(value) > 40 || value[0] < 'A' || value[0] > 'Z' {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// apiError keeps only the bounded error envelope: response bodies are never
+// echoed, so a panel that reflects credentials cannot leak them into logs.
+func apiError(resp *http.Response) error {
+	e := &APIError{Status: resp.StatusCode}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return e
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &envelope) == nil && stableCode(envelope.Error.Code) {
+		e.Code = envelope.Error.Code
+	}
+	return e
+}
+
 type TrafficLabel struct {
 	Label     string `json:"label"`
 	UserID    int64  `json:"user_id"`
@@ -102,7 +150,7 @@ func (c *Client) request(ctx context.Context, method, path string, body, out any
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("panel returned HTTP %d", resp.StatusCode)
+		return apiError(resp)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, MaxBody+1))
 	if err != nil || len(raw) > MaxBody {

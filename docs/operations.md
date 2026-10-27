@@ -13,6 +13,7 @@ Default local layout:
 /var/lib/mboard-node/collector.json         cursors + pending immutable batch journal (0600)
 /var/lib/mboard-node/agent.lock             exclusive daemon lock (0600)
 /var/lib/mboard-node/spool/<batch_id>.json   pending real traffic deltas (0600)
+/var/lib/mboard-node/spool/rejected/<batch_id>.json  batches the panel refused (0600)
 ```
 
 Use an administrator-controlled account. Keep config/data directories mode `0700` and on a local filesystem that supports atomic rename, hard links, directory fsync and flock. The daemon creates missing managed directories with `0700` and enforces `data_dir` mode `0700` even when it exists. `ingest` can run concurrently with the daemon, but must not duplicate automatic core accounting. Two daemons cannot share a data directory. Do not run a separate sing-box service against the same ports; this agent owns one child. Reserve sufficient disk space because accounting batches remain on disk until acknowledged. Monitor spool size and free disk space outside this agent.
@@ -89,13 +90,15 @@ SIGTERM or Ctrl-C cancels HTTP/check work, waits for workers, and takes a final 
 
 The agent ships an automatic local V2Ray gRPC collector. Use pinned sing-box v1.14.3 built with `with_v2ray_api`, emitted authenticated user names and the optional envelope `traffic_labels` mappings. The API reads nonreset cumulative user counters, including short closed connections, and commits cursor + immutable batch records atomically in `collector.json`. See [telemetry.md](telemetry.md) for exact config/heartbeat fields, opaque identity rules, SS2022 multiuser requirements, state bounds and unavoidable core-exit loss limits.
 
-Automatic collection stops admission at 256 MiB by default or 10,000 spool entries without resetting core counters. Set `telemetry_spool_max_bytes` to `33554432` (32 MiB) for tiny containers and reserve filesystem space separately. Final shutdown checkpoints bypass this soft admission limit into bounded journal storage. File enumeration is paged rather than materializing the whole backlog. Manual ingest can bypass those bounds; operate it as a separate trusted source, never the same core's counters.
+Automatic collection stops admission at 256 MiB by default or 10,000 queued `.json` batches without resetting core counters. Set `telemetry_spool_max_bytes` to `33554432` (32 MiB) for tiny containers and reserve filesystem space separately. Final shutdown checkpoints bypass this soft admission limit into bounded journal storage. File enumeration is paged rather than materializing the whole backlog. Manual ingest can bypass those bounds; operate it as a separate trusted source, never the same core's counters.
 
 Do not delete or hand-edit collector cursors to fix an outage: resetting a cursor while the core still lives can bill its lifetime traffic again. A malformed journal blocks collection instead of silently resetting it. Stop the service, preserve journal+spool together, and reconcile/restore from a known-good backup. Core counters after the last checkpoint disappear when that core exits, so a pending outage should be repaired before restarting if possible. Certificate renewal and every accepted config revision restart the core, disconnecting existing users.
 
 Clash snapshots are not a replacement: they lack authenticated user identity. The V2Ray API is per username, so distinct entry nodes need distinct auth names. Aliases can stay unchanged through exact `traffic_labels` mappings. Inbound-wide/outbound-wide stats are never added to user records. The backend ledger must retain machine+batch deduplication through restores.
 
-A malformed spool file blocks the delivery loop rather than silently discarding accounting data. Stop the daemon, inspect the file in a protected terminal, then repair it or move it outside `spool` into an operator-owned quarantine directory. Reconcile its counters before deleting it. Records the server rejects because their node/user grant changed also stay queued and need operator reconciliation. Neither the agent nor the contract provides historical-grant reconciliation automatically.
+Delivery separates transient from permanent failure so one batch can never head-of-line block the queue. Transport errors, `401` (the machine may be re-enrolled), `404`/`405` (the endpoint may have moved), `408`, `429` and every `5xx` keep the batch queued and retried with backoff. A `400`, `403`, `409`, `410`, `413`, `415` or `422` is a verdict about the batch itself: the agent moves it to `spool/rejected/` untouched, logs `traffic: retired batch <id>` once, and continues with the next batch. Up to 64 batches may be retired per pass so heartbeat and config work are never starved. Corrupt JSON and batches failing their own validation are retired the same way. Nothing is deleted, so an operator can still read what the panel refused.
+
+Retired batches usually mean the record's node/user grant changed or the user was deleted while its traffic was still queued. Reconcile them by hand: restore the grant and re-post the batch, or keep it in `spool/rejected/` as the accounting record. Neither the agent nor the contract provides historical-grant reconciliation automatically. Deleting a user in the panel does not flush batches already queued on nodes; poll each machine's `telemetry_ready` after user removals.
 
 ## Backups and troubleshooting
 
@@ -105,5 +108,6 @@ Back up the generated config and `state.json` together, plus `collector.json`, p
 - `sing-box check failed`: inspect core version, generated JSON and required TLS files locally. The old config is kept.
 - Repeated startup failure: check occupied ports, privileges and core compatibility. Inspect the returned generic error and run core in a protected terminal if needed.
 - Digest mismatch: usually an interrupted apply or manual disk edits. The agent will refetch. Restore the known-good pair if the panel is unavailable.
-- Large spool: inspect transport errors, grant rejections and disk capacity. Batches are intentionally not dropped.
+- Large spool: inspect transport errors and disk capacity. Retryable failures keep batches queued by design; they are never dropped.
+- Growing `spool/rejected/`: the panel refused those batches permanently. Check deleted users and the node's group ids against the record's user, then restore the grant and re-post or archive the files.
 - Online machine but unreachable proxy: heartbeat means the agent can reach the panel, not that the core, firewall or TLS works. Test a real client connection.

@@ -89,6 +89,11 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 		logger.Printf("local config state: %v", err)
 	}
 	spool := Spool{Dir: filepath.Join(c.DataDir, "spool")}
+	// A batch the panel refuses outright is moved to spool/rejected so the rest
+	// of the queue keeps flowing; surface it once instead of retrying forever.
+	spool.OnReject = func(batchID string, err error) {
+		logger.Printf("traffic: retired batch %s: %v", batchID, err)
+	}
 	telemetryInterval, _ := time.ParseDuration(c.TelemetryInterval)
 	if telemetryInterval == 0 {
 		telemetryInterval = 5 * time.Second

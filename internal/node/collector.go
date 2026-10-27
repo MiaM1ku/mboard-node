@@ -22,6 +22,10 @@ const maxTrafficLabels = 10000
 const maxJournalBytes = 32 << 20
 const defaultSpoolLimit int64 = 256 << 20
 
+// maxSpoolEntries is the queued-batch count at which the collector stops
+// publishing so the on-disk queue cannot grow without bound.
+const maxSpoolEntries = 10000
+
 var ErrTelemetryDisabled = errors.New("native config has no enabled per-user V2Ray telemetry")
 var canonicalLabel = regexp.MustCompile(`^mb:u:([1-9][0-9]*):n:([1-9][0-9]*)(?::p:(.+))?$`)
 
@@ -225,7 +229,7 @@ func (c *Collector) spoolCapacity() error {
 		defer dir.Close()
 	}
 	var total int64
-	count := 0
+	batches := 0
 	if dir != nil {
 		for {
 			entries, e := dir.ReadDir(128)
@@ -233,12 +237,14 @@ func (c *Collector) spoolCapacity() error {
 				return e
 			}
 			for _, entry := range entries {
-				count++
-				if count >= 10000 {
-					return errors.New("traffic spool entry limit reached; core counters retained")
-				}
+				// Directories (including the rejected-batch quarantine) and
+				// in-flight staging files are not queued batches.
 				if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 					continue
+				}
+				batches++
+				if batches >= maxSpoolEntries {
+					return fmt.Errorf("traffic spool holds %d batches (limit %d); core counters retained until the queue drains", batches, maxSpoolEntries)
 				}
 				info, e := entry.Info()
 				if os.IsNotExist(e) {
