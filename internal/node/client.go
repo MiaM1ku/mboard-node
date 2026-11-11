@@ -212,3 +212,28 @@ func (c *Client) Traffic(ctx context.Context, b Batch) error {
 	}
 	return nil
 }
+
+// Connections posts one aggregated connection batch. The implied receipt is
+// checked for the same reason as Traffic: a panel that answers "accepted": false
+// is a contract violation, not a verdict about the batch, so the caller keeps it
+// queued and retries with the same batch_id.
+func (c *Client) Connections(ctx context.Context, b ConnBatch) error {
+	if err := b.Validate(); err != nil {
+		return err
+	}
+	var out struct {
+		Accepted bool  `json:"accepted"`
+		Stored   int64 `json:"stored"`
+		Skipped  int64 `json:"skipped"`
+	}
+	if err := c.request(ctx, http.MethodPost, "/api/node/v1/connections", b, &out); err != nil {
+		return err
+	}
+	if !out.Accepted {
+		return errors.New("panel did not acknowledge connection batch")
+	}
+	if out.Stored < 0 || out.Skipped < 0 {
+		return errors.New("invalid connection batch receipt")
+	}
+	return nil
+}

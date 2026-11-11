@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -27,9 +28,18 @@ type Core interface {
 type ProcessCore struct {
 	Binary                           string
 	Timeout, StartupGrace, StopGrace time.Duration
-	cmd                              *exec.Cmd
-	done                             chan struct{}
-	counterGeneration                string
+	// OnLine receives every complete line of the child's stderr when non-nil.
+	// Nil keeps the 0.2.2 start path exactly: core output is discarded, no pipe
+	// and no reader goroutine exist, so an operator that disables the connection
+	// log gets the previous behaviour rather than a differently-wired core.
+	// The slice is only valid for the duration of the call; a receiver that keeps
+	// data must copy it.
+	OnLine            func([]byte)
+	cmd               *exec.Cmd
+	done              chan struct{}
+	logRead           *os.File
+	readers           sync.WaitGroup
+	counterGeneration string
 }
 
 func (p *ProcessCore) Check(ctx context.Context, path string) error {
@@ -68,8 +78,36 @@ func (p *ProcessCore) Restart(ctx context.Context, path string) error {
 	cmd := exec.Command(p.Binary, "run", "-c", path)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	// No shell, no remote arguments and no unfiltered core output in agent logs.
+	var logReader, logWriter *os.File
+	if p.OnLine != nil {
+		// A pipe, not a buffer: the reader copies only the lines it needs, so the
+		// child never blocks on a full buffer and the agent never retains the
+		// whole log stream in memory. Stdout stays discarded.
+		reader, writer, pipeErr := os.Pipe()
+		if pipeErr != nil {
+			return errors.New("start sing-box failed")
+		}
+		logReader, logWriter = reader, writer
+		cmd.Stderr = logWriter
+	}
 	if err := cmd.Start(); err != nil {
+		if logReader != nil {
+			logReader.Close()
+			logWriter.Close()
+		}
 		return errors.New("start sing-box failed")
+	}
+	if logWriter != nil {
+		// The parent must not keep the write end: only the child holding it lets
+		// the reader observe EOF when the core exits.
+		logWriter.Close()
+		onLine := p.OnLine
+		p.logRead = logReader
+		p.readers.Add(1)
+		go func() {
+			defer p.readers.Done()
+			readCoreLines(logReader, onLine)
+		}()
 	}
 	p.cmd = cmd
 	p.done = make(chan struct{})
@@ -93,6 +131,7 @@ func (p *ProcessCore) Stop() error {
 	}
 	if !p.Running() {
 		p.cmd = nil
+		p.stopLogReader()
 		return nil
 	}
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
@@ -109,7 +148,57 @@ func (p *ProcessCore) Stop() error {
 		<-p.done
 	}
 	p.cmd = nil
+	p.stopLogReader()
 	return nil
+}
+
+// stopLogReader releases the stderr reader once the child is gone. Closing the
+// read end also unblocks a reader whose write end is still held by a core
+// descendant, so Stop is bounded and OnLine is quiet after it returns.
+func (p *ProcessCore) stopLogReader() {
+	if p.logRead != nil {
+		p.logRead.Close()
+		p.logRead = nil
+	}
+	p.readers.Wait()
+}
+
+// readCoreLines forwards complete core log lines to onLine.
+//
+// A line longer than the read buffer is dropped whole: a truncated line must
+// never be parsed as if it were a real record, and draining it to the next
+// newline keeps the child from blocking on a full pipe. A trailing partial line
+// at EOF has no terminator and is therefore not a complete core record.
+func readCoreLines(f *os.File, onLine func([]byte)) {
+	defer f.Close()
+	reader := bufio.NewReaderSize(f, 8<<10)
+	for {
+		line, err := reader.ReadSlice('\n')
+		switch {
+		case err == nil:
+			onLine(bytes.TrimRight(line, "\r\n"))
+		case errors.Is(err, bufio.ErrBufferFull):
+			if !discardCoreLine(reader) {
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
+// discardCoreLine skips the remainder of an overlong line and reports whether
+// reading may continue.
+func discardCoreLine(reader *bufio.Reader) bool {
+	for {
+		_, err := reader.ReadSlice('\n')
+		if err == nil {
+			return true
+		}
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return false
+		}
+	}
 }
 
 type State struct {
@@ -126,15 +215,49 @@ type Manager struct {
 	mu              sync.Mutex
 	generation      string
 	spec            TelemetrySpec
-	activeSHA       string
-	BeforeRestart   func(context.Context, TelemetrySpec, string) error
-	BeforeRollback  func(context.Context, TelemetrySpec, string) error
-	writeState      func(string, []byte) error
+	// labels publishes the accounting mapping of the configuration the running
+	// core was started from. The connection log reads it for every log line, so
+	// it is an immutable snapshot behind an atomic pointer instead of a field
+	// guarded by the lifecycle lock (which would serialize log parsing behind
+	// config application and core restarts).
+	labels         atomic.Pointer[map[string]TrafficLabel]
+	activeSHA      string
+	BeforeRestart  func(context.Context, TelemetrySpec, string) error
+	BeforeRollback func(context.Context, TelemetrySpec, string) error
+	writeState     func(string, []byte) error
 }
 
 func digest(data []byte) string { h := sha256.Sum256(data); return hex.EncodeToString(h[:]) }
+
+// setSpec is the single place that records which telemetry spec (address and
+// accounting mapping) the running core was started from. Every assignment site
+// goes through it so the published label snapshot can never disagree with the
+// spec the rest of the manager uses. The map is published as an immutable
+// snapshot: callers replace it, never mutate it.
+func (m *Manager) setSpec(spec TelemetrySpec) {
+	m.spec = spec
+	labels := spec.Labels
+	if labels == nil {
+		labels = map[string]TrafficLabel{}
+	}
+	m.labels.Store(&labels)
+}
+
+// Labels returns the accounting mapping of the current core generation. It is
+// safe to call from any goroutine, including while a config revision is being
+// applied or rolled back, and never returns nil.
+func (m *Manager) Labels() map[string]TrafficLabel {
+	if snapshot := m.labels.Load(); snapshot != nil {
+		return *snapshot
+	}
+	return map[string]TrafficLabel{}
+}
+
 func NewManager(c Config, core Core) (*Manager, error) {
 	m := &Manager{Path: c.ConfigPath, StatePath: filepath.Join(c.DataDir, "state.json"), Core: core}
+	// A manager without a trusted state file still publishes an empty mapping, so
+	// the connection log has one uniform accessor for the basic naming scheme.
+	m.setSpec(TelemetrySpec{})
 	raw, err := os.ReadFile(m.StatePath)
 	if os.IsNotExist(err) {
 		return m, nil
@@ -149,10 +272,11 @@ func NewManager(c Config, core Core) (*Manager, error) {
 	if err != nil || digest(cfg) != m.state.SHA256 {
 		return m, errors.New("revision state/config mismatch; refetching panel config")
 	}
-	m.spec, err = telemetrySpec(cfg, m.state.TrafficLabels)
+	spec, err := telemetrySpec(cfg, m.state.TrafficLabels)
 	if err != nil {
 		return m, err
 	}
+	m.setSpec(spec)
 	m.applied = true
 	m.revision.Store(m.state.Revision)
 	return m, nil
@@ -327,7 +451,8 @@ func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
 		if restoreErr != nil {
 			return fmt.Errorf("apply failed; previous config restored but core recovery failed: %w", cause)
 		}
-		m.spec, m.activeSHA = oldSpec, oldActiveSHA
+		m.setSpec(oldSpec)
+		m.activeSHA = oldActiveSHA
 		return fmt.Errorf("apply failed; previous config restored: %w", cause)
 	}
 	if err = syncDir(filepath.Dir(m.Path)); err != nil {
@@ -337,7 +462,10 @@ func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
 		return rollback(err)
 	}
 	candidateStarted = true
-	m.spec, m.activeSHA = spec, hash
+	// Publish the candidate mapping as soon as its core serves traffic, so
+	// connection log lines from the new generation resolve to the new identity.
+	m.setSpec(spec)
+	m.activeSHA = hash
 	next := State{Revision: r.Revision, SHA256: hash, TrafficLabels: r.TrafficLabels}
 	stateRaw, _ := json.Marshal(next)
 	writeState := m.writeState
@@ -363,7 +491,7 @@ func (m *Manager) Apply(ctx context.Context, r RemoteConfig) error {
 		return recovered
 	}
 	m.state = next
-	m.spec = spec
+	m.setSpec(spec)
 	m.applied = true
 	m.revision.Store(next.Revision)
 	return nil

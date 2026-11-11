@@ -2,9 +2,11 @@
 
 A standalone Go machine agent for mboard's v1 node protocol. Module: `mboard.dev/node`. The executable has no runtime or protocol dependency on another panel. The only non-standard runtime libraries are official gRPC/protobuf packages and their pinned Go dependencies. Linux is the supported operating system (local `flock`, parent-death signal and SIGTERM lifecycle).
 
-The agent authenticates with a machine Bearer token, sends heartbeats, fetches complete native sing-box server JSON, validates revisions, manages one external sing-box child, and automatically collects per-user/per-entry-node counters. It never downloads executables or runs remote shell commands. Install the pinned compatible core separately.
+The agent authenticates with a machine Bearer token, sends heartbeats, fetches complete native sing-box server JSON, validates revisions, manages one external sing-box child, and automatically collects per-user/per-entry-node counters. Since 0.3.0 it also reads the child's info log to report which destinations authenticated users reached, aggregated per hour. It never downloads executables or runs remote shell commands. Install the pinned compatible core separately.
 
 **Automatic accounting requires a core built with `with_v2ray_api`.** The verified stock v1.14.3 Linux binary lacks that tag. The panel must emit authenticated user names, enable local V2Ray user stats, and supply opaque-name mappings when names aren't canonical `mb:u:<uid>:n:<entry>[:p:<profile>]`. Closed TCP/UDP counters survive until the core exits, so connections that start and end between polls are counted. This measures routed authenticated payload bytes, not NIC totals. See [telemetry contract](docs/telemetry.md) for exact fields, durable guarantees and restart loss limits.
+
+**The connection log needs only `log{level:"info"}`**, not the stats API: it reads the destinations sing-box already prints for each authenticated connection and reports them to `POST /api/node/v1/connections` per hour. It is best effort and purely observational — bytes still come from the collector — and `connection_log:"off"` restores the 0.2.2 start path where core stderr is discarded. See [telemetry contract](docs/telemetry.md#connection-log-agent-030) for the log format, aggregation key, memory bounds and privacy scope.
 
 ## Build and test
 
@@ -57,10 +59,11 @@ All keys are snake_case. Unknown agent keys are rejected. Paths must be absolute
 | `telemetry_interval` | `5s`, successful cumulative gRPC poll interval |
 | `telemetry_timeout` | `5s`, local gRPC deadline |
 | `telemetry_spool_max_bytes` | `268435456` (256 MiB), automatic spool admission budget; 0 uses default. Set `33554432` (32 MiB) for low-disk containers. |
+| `connection_log` | `on`, report aggregated connections read from the core's `info` log; `off` discards core stderr exactly like 0.2.2 |
 | `tls_ca_path` | Empty, or private panel CA PEM |
 | `tls_cert_path`, `tls_key_path` | Empty, or paired panel mTLS client files |
 
-Durations accept Go forms such as `15s` and `1m`, from one second to one hour. Every key can be overridden with `MBOARD_NODE_` plus its uppercase name, for example `MBOARD_NODE_PANEL_URL`, `MBOARD_NODE_TOKEN`, `MBOARD_NODE_CONFIG_PATH`, `MBOARD_NODE_CORE_BINARY`, `MBOARD_NODE_INTERVAL`, `MBOARD_NODE_TLS_CA_PATH`. The local JSON file is still required. Command `-config` selects that agent file; JSON `config_path` selects the generated sing-box file.
+Durations accept Go forms such as `15s` and `1m`, from one second to one hour. Every key can be overridden with `MBOARD_NODE_` plus its uppercase name, for example `MBOARD_NODE_PANEL_URL`, `MBOARD_NODE_TOKEN`, `MBOARD_NODE_CONFIG_PATH`, `MBOARD_NODE_CORE_BINARY`, `MBOARD_NODE_INTERVAL`, `MBOARD_NODE_CONNECTION_LOG`, `MBOARD_NODE_TLS_CA_PATH`. The local JSON file is still required. Command `-config` selects that agent file; JSON `config_path` selects the generated sing-box file.
 
 ## Manual ingest (trusted integrations only)
 

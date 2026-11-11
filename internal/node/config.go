@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const Version = "0.2.2"
+const Version = "0.3.0"
 const MaxBody = 1 << 20
 const MaxSafeInteger int64 = 9007199254740991
 
@@ -28,13 +28,17 @@ type Config struct {
 	TelemetryInterval      string `json:"telemetry_interval,omitempty"`
 	TelemetryTimeout       string `json:"telemetry_timeout,omitempty"`
 	TelemetrySpoolMaxBytes int64  `json:"telemetry_spool_max_bytes,omitempty"`
-	TLSCAPath              string `json:"tls_ca_path"`
-	TLSCertPath            string `json:"tls_cert_path"`
-	TLSKeyPath             string `json:"tls_key_path"`
+	// ConnectionLog switches the 0.3.0 connection log on stderr capture. "on"
+	// (the default) reports aggregated connections; "off" restores the 0.2.2
+	// start path where core output is discarded entirely.
+	ConnectionLog string `json:"connection_log,omitempty"`
+	TLSCAPath     string `json:"tls_ca_path"`
+	TLSCertPath   string `json:"tls_cert_path"`
+	TLSKeyPath    string `json:"tls_key_path"`
 }
 
 func LoadConfig(path string) (Config, error) {
-	c := Config{ConfigPath: "/etc/mboard-node/sing-box.json", CoreBinary: "/usr/local/bin/sing-box", DataDir: "/var/lib/mboard-node", Interval: "30s", RequestTimeout: "15s", TelemetryInterval: "5s", TelemetryTimeout: "5s"}
+	c := Config{ConfigPath: "/etc/mboard-node/sing-box.json", CoreBinary: "/usr/local/bin/sing-box", DataDir: "/var/lib/mboard-node", Interval: "30s", RequestTimeout: "15s", TelemetryInterval: "5s", TelemetryTimeout: "5s", ConnectionLog: "on"}
 	f, err := os.Open(path)
 	if err != nil {
 		return c, fmt.Errorf("open agent config: %w", err)
@@ -43,7 +47,7 @@ func LoadConfig(path string) (Config, error) {
 	if err = decodeStrict(io.LimitReader(f, MaxBody+1), &c); err != nil {
 		return c, errors.New("invalid agent config JSON")
 	}
-	vars := map[string]*string{"PANEL_URL": &c.PanelURL, "TOKEN": &c.Token, "CONFIG_PATH": &c.ConfigPath, "CORE_BINARY": &c.CoreBinary, "DATA_DIR": &c.DataDir, "INTERVAL": &c.Interval, "REQUEST_TIMEOUT": &c.RequestTimeout, "TELEMETRY_INTERVAL": &c.TelemetryInterval, "TELEMETRY_TIMEOUT": &c.TelemetryTimeout, "TLS_CA_PATH": &c.TLSCAPath, "TLS_CERT_PATH": &c.TLSCertPath, "TLS_KEY_PATH": &c.TLSKeyPath}
+	vars := map[string]*string{"PANEL_URL": &c.PanelURL, "TOKEN": &c.Token, "CONFIG_PATH": &c.ConfigPath, "CORE_BINARY": &c.CoreBinary, "DATA_DIR": &c.DataDir, "INTERVAL": &c.Interval, "REQUEST_TIMEOUT": &c.RequestTimeout, "TELEMETRY_INTERVAL": &c.TelemetryInterval, "TELEMETRY_TIMEOUT": &c.TelemetryTimeout, "CONNECTION_LOG": &c.ConnectionLog, "TLS_CA_PATH": &c.TLSCAPath, "TLS_CERT_PATH": &c.TLSCertPath, "TLS_KEY_PATH": &c.TLSKeyPath}
 	for key, dst := range vars {
 		if v, ok := os.LookupEnv("MBOARD_NODE_" + key); ok {
 			*dst = v
@@ -139,6 +143,11 @@ func (c Config) Validate() error {
 	if (c.TLSCertPath == "") != (c.TLSKeyPath == "") {
 		return errors.New("tls_cert_path and tls_key_path must be set together")
 	}
+	// Empty keeps the documented default ("on"), so an agent config written for
+	// 0.2.2 keeps working untouched and simply starts reporting connections.
+	if c.ConnectionLog != "" && c.ConnectionLog != "on" && c.ConnectionLog != "off" {
+		return errors.New(`connection_log must be "on" or "off"`)
+	}
 	for _, p := range []string{c.TLSCAPath, c.TLSCertPath, c.TLSKeyPath} {
 		if p != "" && !filepath.IsAbs(p) {
 			return errors.New("TLS paths must be absolute")
@@ -146,6 +155,11 @@ func (c Config) Validate() error {
 	}
 	return nil
 }
+
+// ConnectionLogEnabled reports whether the agent should capture core stderr and
+// report connections. An empty value is the documented default ("on") so an
+// untouched 0.2.2 agent config opts in automatically on upgrade.
+func (c Config) ConnectionLogEnabled() bool { return c.ConnectionLog != "off" }
 
 func decodeStrict(r io.Reader, v any) error {
 	d := json.NewDecoder(r)
@@ -211,14 +225,24 @@ type Batch struct {
 	Records []Record `json:"records"`
 }
 
-func (b Batch) Validate() error {
-	if len(b.BatchID) < 1 || len(b.BatchID) > 128 {
+// validBatchID enforces the shared idempotency-key shape for traffic and
+// connection batches: 1-128 characters from a filename-safe alphabet, so a
+// batch ID can never escape a spool path or an SQL/URL context on the panel.
+func validBatchID(id string) error {
+	if len(id) < 1 || len(id) > 128 {
 		return errors.New("batch_id must be 1-128 safe filename characters")
 	}
-	for _, r := range b.BatchID {
+	for _, r := range id {
 		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
 			return errors.New("batch_id must use letters, digits, hyphen or underscore")
 		}
+	}
+	return nil
+}
+
+func (b Batch) Validate() error {
+	if err := validBatchID(b.BatchID); err != nil {
+		return err
 	}
 	if len(b.Records) == 0 || len(b.Records) > 10000 {
 		return errors.New("records must contain 1-10000 entries")

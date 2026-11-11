@@ -105,6 +105,16 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 	collector := &Collector{Path: filepath.Join(c.DataDir, "collector.json"), Spool: spool, Reader: GRPCStats{}, Timeout: telemetryTimeout, SpoolLimit: c.TelemetrySpoolMaxBytes}
 	manager.BeforeRestart = collector.Poll
 	manager.BeforeRollback = collector.Final
+	// The connection log is an observation layer on top of 0.2.2: it reads the
+	// core's stderr, never touches the journal, spool or counters, and can be
+	// switched off so the start path is byte-for-byte the previous release.
+	var connLog *ConnLog
+	if c.ConnectionLogEnabled() {
+		connLog = NewConnLog()
+		connLog.Labels = manager.Labels
+		connLog.Log = logger.Printf
+		core.OnLine = connLog.OnLine
+	}
 	interval, _ := time.ParseDuration(c.Interval)
 	started := time.Now()
 	var wg sync.WaitGroup
@@ -136,6 +146,11 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 	})
 	start("collector", telemetryInterval, func(ctx context.Context) error { return manager.Collect(ctx, collector) })
 	start("traffic", time.Second, func(ctx context.Context) error { return spool.Flush(ctx, client) })
+	if connLog != nil {
+		// One minute of aggregation keeps POSTs cheap while the panel still sees
+		// hour buckets appear promptly.
+		start("connections", time.Minute, func(ctx context.Context) error { return connLog.Flush(ctx, client) })
+	}
 	logger.Print("agent started; machine token [REDACTED]")
 	<-ctx.Done()
 	wg.Wait()
@@ -144,5 +159,16 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 	if err := manager.FinalCollect(finalCtx, collector); err != nil {
 		logger.Printf("shutdown traffic drain: %v", err)
 	}
-	return core.Stop()
+	stopErr := core.Stop()
+	if connLog != nil {
+		// The core is stopped first, so nothing arrives from the pipe while the
+		// final flush runs; a short deadline keeps shutdown inside the unit's
+		// shutdown budget.
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := connLog.Flush(flushCtx, client); err != nil {
+			logger.Printf("shutdown connection flush: %v", err)
+		}
+		flushCancel()
+	}
+	return stopErr
 }

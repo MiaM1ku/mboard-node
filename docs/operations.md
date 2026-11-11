@@ -84,7 +84,7 @@ Config and revision metadata are two files, not one filesystem transaction. A po
 
 Successful heartbeat/config polls use `interval` (default 30 seconds). Traffic sends at most one pending batch per second. Each loop retries errors starting at one second and doubles up to five minutes, with up to 25% jitter. Loops are independent so a backlog or hung traffic endpoint does not delay heartbeat. HTTP requests and `check` commands are bounded by `request_timeout` (default 15 seconds). Persistent authentication errors also back off; replace a rotated token and restart the agent.
 
-SIGTERM or Ctrl-C cancels HTTP/check work, waits for workers, and takes a final bounded journal checkpoint before stopping the child with SIGTERM/10-second kill fallback. This final checkpoint bypasses the soft spool cap and can retain pending batches without publishing them; startup recovery publishes them even if the core is down. Hard disk failure or unavailable gRPC can still prevent that sample and is logged. Linux parent-death SIGKILL prevents orphan core listeners after agent death. A rollback already in progress can take up to its 30-second recovery deadline plus child-stop time and a 15-second candidate drain. Set the service shutdown timeout to at least 75 seconds. Pending batches remain for the next start.
+SIGTERM or Ctrl-C cancels HTTP/check work, waits for workers, and takes a final bounded journal checkpoint before stopping the child with SIGTERM/10-second kill fallback. This final checkpoint bypasses the soft spool cap and can retain pending batches without publishing them; startup recovery publishes them even if the core is down. Once the child is gone the agent sends one final connection-log batch under a 5-second deadline, so shutdown stays inside the service timeout. Hard disk failure or unavailable gRPC can still prevent that sample and is logged. Linux parent-death SIGKILL prevents orphan core listeners after agent death. A rollback already in progress can take up to its 30-second recovery deadline plus child-stop time and a 15-second candidate drain. Set the service shutdown timeout to at least 75 seconds. Pending batches remain for the next start.
 
 ## Automatic accounting and recovery
 
@@ -100,6 +100,16 @@ Delivery separates transient from permanent failure so one batch can never head-
 
 Retired batches usually mean the record's node/user grant changed or the user was deleted while its traffic was still queued. Reconcile them by hand: restore the grant and re-post the batch, or keep it in `spool/rejected/` as the accounting record. Neither the agent nor the contract provides historical-grant reconciliation automatically. Deleting a user in the panel does not flush batches already queued on nodes; poll each machine's `telemetry_ready` after user removals.
 
+## Connection log
+
+Agent 0.3.0 reports which destinations authenticated users reached. The agent reads the core's own `info` log, which it captures through a pipe on the child's stderr; its stdout stays discarded. Keep the panel-emitted native config at `log{level:"info"}` (a lower level silences the lines) and keep `connection_log` at its default `"on"`. Turning it off with `connection_log:"off"` or `MBOARD_NODE_CONNECTION_LOG=off` discards the child's stderr exactly like 0.2.2 and stops every POST to `/api/node/v1/connections`.
+
+This path is observational and best effort. It writes no files: aggregates, up to 10 queued batches and the client-address table live in memory and are lost on restart. It never changes the journal, the spool or billed bytes, so a panel that rejects or ignores these batches cannot affect accounting. Every minute the agent validates the records locally (hour bucket, target with port, tcp/udp, timestamps inside the hour) and posts at most 2000 per batch with a random deduplicated `batch_id`.
+
+A panel that predates the endpoint answers `404`/`405`. The agent then clears its aggregates and queue, logs `connections: panel does not expose /api/node/v1/connections` once, and probes a single time every 10 minutes, so an old panel sees at most one request per 10 minutes instead of one per minute.
+
+Operators should expect the log to contain the client IP address and the destination host:port. Keep panel retention (7 days) and the operator's own log-access policy in mind, and prefer `connection_log:"off"` on hosts where destination logging is not acceptable.
+
 ## Backups and troubleshooting
 
 Back up the generated config and `state.json` together, plus `collector.json`, pending spool files and TLS keys in encrypted storage. Retain the panel's machine+batch idempotency ledger through panel restores. Losing that ledger while replaying old batches can count traffic twice. Losing spool files can lose unreported accounting.
@@ -110,4 +120,6 @@ Back up the generated config and `state.json` together, plus `collector.json`, p
 - Digest mismatch: usually an interrupted apply or manual disk edits. The agent will refetch. Restore the known-good pair if the panel is unavailable.
 - Large spool: inspect transport errors and disk capacity. Retryable failures keep batches queued by design; they are never dropped.
 - Growing `spool/rejected/`: the panel refused those batches permanently. Check deleted users and the node's group ids against the record's user, then restore the grant and re-post or archive the files.
+- No connection records in the panel: confirm agent 0.3.0 and `connection_log` is not `off`, confirm the native config still logs at `info` to stderr (not to a file and not `disabled`), then check the agent log for `connections: panel does not expose /api/node/v1/connections` (older panel, paused for 10 minutes) or `connections: discarded batch` (the panel refused a batch permanently). A core-built-in `log.output` pointing at a file hides the lines from the agent.
+- Connection counts lower than expected: observation is best effort. Lines logged before the agent attached, overlong lines, connections whose destination line never appears, and restart windows are dropped by design; `connections: dropped N buckets above the 20000-key limit` means the node is busier than the aggregation bound.
 - Online machine but unreachable proxy: heartbeat means the agent can reach the panel, not that the core, firewall or TLS works. Test a real client connection.

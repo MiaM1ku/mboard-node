@@ -1,5 +1,36 @@
 # Automatic telemetry contract and production deployment
 
+## Connection log (agent 0.3.0)
+
+0.3.0 adds an observation layer beside billing; it does not change the config envelope, `traffic_labels`, the journal, the spool or any heartbeat field, so a 0.3.0 agent reads a 0.2.2 journal and spool in place and a 0.2.2 agent simply stops reporting connections.
+
+Where the data comes from: the core's `info` log on stderr. The V2Ray stats API is aggregated per username and has no destination dimension, so the only place sing-box names a destination is the log line each authenticated connection already produces. The agent captures the child's stderr through a pipe (its stdout stays discarded), decodes the logrusorgru/aurora coloured and optionally timestamped form `INFO[<seconds>] [<connection> <duration>] inbound/<type>[<tag>]: <message>`, and pairs two lines of the same connection by the connection ID both carry:
+
+```text
+inbound/vless[mb:n:21]: inbound connection from 203.0.113.9:51234
+inbound/vless[mb:n:21]: [mb:u:7:n:21:p:0] inbound connection to example.com:443
+```
+
+Vless, trojan, anytls, shadowsocks multi-user, socks and vmess emit the same shapes; TCP uses `inbound connection from/to`, UDP uses `inbound packet connection from/to`. The `[user]` prefix may itself contain colons, so it ends at the first `]`. A destination without a matching source line is still counted with an empty `source_ip`.
+
+Identity: the `traffic_labels` mapping of the running core generation wins, exactly like billing. Without a mapping, the basic naming scheme applies — the panel names the authenticated user after the account ID and tags the inbound `node-<id>` — and every other user name is dropped, never guessed. A rolled-back revision restores the previous mapping before its core serves, so log lines from the old generation cannot be attributed to the candidate.
+
+Aggregation key: `(user_id, node_id, hour, target, source_ip, network)`, hour being the UTC hour bucket. `target` is canonicalised to lowercase host plus numeric port (IPv6 keeps its brackets) and limited to 270 characters; `source_ip` is a canonicalised IP address (IPv6 zones stripped, IPv4-mapped addresses unmapped). Repeated observations of the same key inside one flush window merge into one record with `count`, `first_at` and `last_at`. Because a row is sent as soon as it is flushed, the same key can legitimately arrive in more than one batch during the same hour; the panel merges rows instead of inserting duplicates.
+
+Delivery: every 60 seconds the aggregates are frozen into batches of at most 2000 records with a random `batch_id` and posted to `POST /api/node/v1/connections` as
+
+```json
+{"batch_id":"<1-128 [A-Za-z0-9_-]>","records":[{"user_id":7,"node_id":21,"hour":1762819200,"target":"example.com:443","source_ip":"203.0.113.9","network":"tcp","count":3,"first_at":1762819234,"last_at":1762819500}]}
+```
+
+and the panel answers `{"data":{"accepted":true,"stored":N,"skipped":M}}`. The agent validates every record locally first, so the panel should never need to reject a whole batch. Retrying the same `batch_id` is safe: the panel deduplicates on it. Transport errors, `401`, `404`/`405`, `408`, `429` and `5xx` keep the batch queued; `400`, `403`, `409`, `410`, `413`, `415` and `422` discard that batch after one log line, because it is a verdict about the batch and must not block the queue.
+
+A `404`/`405` answer is a version signal, not a batch verdict: it means the panel predates this endpoint. The agent then clears both the aggregates and the queue, logs `connections: panel does not expose /api/node/v1/connections` once, and pauses for 10 minutes. The first flush after that window is a single probe; a second 404/405 restarts the pause. Nothing accumulates in between, so an un-upgraded panel costs nothing but the log line.
+
+Memory bounds, all in memory and never on disk: 20000 aggregation buckets (further observations are counted and reported as `connections: dropped N buckets` on the next flush), 20000 pending source addresses that expire after 60 seconds, 10 queued batches (the oldest is dropped, keeping the newest data), and a 1 MiB request cap enforced by the existing client. There is no journal: a restart or a core restart loses at most the current minute of observations, and shutdown takes one final flush after the child stops.
+
+Privacy scope: records contain the authenticated user, the entry node, the destination host and port, the client IP address, the network and the count. They contain no payload, no username/password, no TLS SNI beyond the destination, and no DNS query names that were hijacked locally. The panel keeps them for 7 days. Operators who do not want destination logging on disk set `connection_log:"off"`, which also restores the 0.2.2 start path where the child's stderr is discarded.
+
 ## Delivery quarantine (agent 0.2.2)
 
 0.2.2 changes only how queued traffic batches leave the node; the config, `traffic_labels` and journal formats are unchanged, so a 0.2.2 agent reads a 0.2.1 journal and spool in place. Field case that forced it: an administrator deleted users on 2026-10-15. Each node still had one last batch for those users in `spool/`, the panel answered `403 TRAFFIC_GRANT` for the whole batch, and the pre-0.2.2 loop returned without removing the file. That batch stayed at the head of the queue, the spool filled to its 10,000-batch limit, the collector stopped publishing, `telemetry_ready` went to 0, and the nodes dropped out of subscriptions while still heartbeating. Two machines were affected before it was found.
