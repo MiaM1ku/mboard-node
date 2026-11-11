@@ -801,3 +801,114 @@ func TestConnectionLogConfigToggle(t *testing.T) {
 		t.Fatalf("env override %+v %v", loaded.ConnectionLog, err)
 	}
 }
+
+// TestParseSniffDomain covers the debug record the router writes after sniffing
+// a connection: the message is tagged ("router: ..."), may carry a timestamp and
+// colours, and a record without a domain is not a sniff result.
+func TestParseSniffDomain(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		line   string
+		domain string
+		ok     bool
+	}{
+		{
+			name:   "router tagged tls sniff",
+			line:   "DEBUG[0002] [42 1.20s] router: sniffed protocol: tls, domain: video.example.com",
+			domain: "video.example.com",
+			ok:     true,
+		},
+		{
+			name:   "timestamped and colored",
+			line:   "\x1b[37m+0800 2026-11-11 16:00:00 \x1b[0mDEBUG[0002] [\x1b[38;5;123m43\x1b[0m 0ms] router: sniffed protocol: tls, domain: API.Example.NET",
+			domain: "API.Example.NET",
+			ok:     true,
+		},
+		{
+			name:   "packet sniff",
+			line:   "DEBUG[0003] [44 0ms] router: sniffed packet protocol: quic, domain: dns.example.com",
+			domain: "dns.example.com",
+			ok:     true,
+		},
+		{
+			name: "protocol without domain",
+			line: "DEBUG[0004] [45 0ms] router: sniffed protocol: bittorrent",
+			ok:   false,
+		},
+		{
+			name: "not a sniff record",
+			line: "DEBUG[0005] [46 0ms] router: connection closed: EOF",
+			ok:   false,
+		},
+		{
+			name: "no logger tag",
+			line: "DEBUG[0006] [47 0ms] sniffed protocol: tls, domain: bare.example.com",
+			// A message with no logger tag still parses: the message marker is at
+			// the start of the body.
+			domain: "bare.example.com",
+			ok:     true,
+		},
+		{
+			name: "info level is not a sniff record",
+			line: "INFO[0001] [48 0ms] inbound/vless[mb:n:21]: sniffed protocol: tls, domain: example.com",
+			ok:   false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			line, ok := parseCoreLine([]byte(tc.line))
+			if !ok {
+				t.Fatalf("line not decoded: %q", tc.line)
+			}
+			domain, ok := parseSniffDomain(line)
+			if ok != tc.ok || domain != tc.domain {
+				t.Fatalf("domain %q ok=%v, want %q ok=%v", domain, ok, tc.domain, tc.ok)
+			}
+		})
+	}
+}
+
+// TestConnLogSniffMovesIpTargetToDomain documents why the move exists: an
+// inbound logs its destination before routing sniffs it, so the IP target is
+// re-attributed to the domain the core found in the TLS ClientHello.
+func TestConnLogSniffMovesIpTargetToDomain(t *testing.T) {
+	clock := &testClock{at: time.Unix(1762819234, 0)}
+	log := NewConnLog()
+	log.Now = clock.Now
+	log.Labels = testLabels
+	log.OnLine(sourceLine(1, "203.0.113.9:51234"))
+	log.OnLine(destLine(1, "mb:u:7:n:21:p:0", "157.254.131.80:443"))
+	log.OnLine([]byte("DEBUG[0002] [1 1.20s] router: sniffed protocol: tls, domain: video.example.com"))
+	recorder := &connRecorder{}
+	if err := log.Flush(context.Background(), recorder); err != nil {
+		t.Fatal(err)
+	}
+	want := ConnRecord{UserID: 7, NodeID: 21, Hour: 1762819200, Target: "video.example.com:443", SourceIP: "203.0.113.9", Network: "tcp", Count: 1, FirstAt: 1762819234, LastAt: 1762819234}
+	if got := recorder.batches[0].Records; !reflect.DeepEqual(got, []ConnRecord{want}) {
+		t.Fatalf("records %+v, want %+v", got, want)
+	}
+
+	// A client that already sent a domain keeps it, even when the sniffed name
+	// differs in case, and the tracked entry is consumed exactly once.
+	log.OnLine(sourceLine(2, "203.0.113.9:51235"))
+	log.OnLine(destLine(2, "mb:u:7:n:21:p:0", "api.example.net:443"))
+	log.OnLine([]byte("DEBUG[0003] [2 1.20s] router: sniffed protocol: tls, domain: API.Example.NET"))
+	log.OnLine([]byte("DEBUG[0004] [2 1.30s] router: sniffed protocol: tls, domain: video.example.com"))
+	recorder = &connRecorder{}
+	if err := log.Flush(context.Background(), recorder); err != nil {
+		t.Fatal(err)
+	}
+	want2 := ConnRecord{UserID: 7, NodeID: 21, Hour: 1762819200, Target: "api.example.net:443", SourceIP: "203.0.113.9", Network: "tcp", Count: 1, FirstAt: 1762819234, LastAt: 1762819234}
+	if got := recorder.batches[0].Records; !reflect.DeepEqual(got, []ConnRecord{want2}) {
+		t.Fatalf("records %+v, want %+v", got, want2)
+	}
+
+	// A sniff line without a tracked connection changes nothing.
+	log.OnLine([]byte("DEBUG[0005] [99 1ms] router: sniffed protocol: tls, domain: orphan.example.com"))
+	recorder = &connRecorder{}
+	if err := log.Flush(context.Background(), recorder); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.batches) != 0 {
+		t.Fatalf("orphan sniff created records %+v", recorder.batches)
+	}
+}

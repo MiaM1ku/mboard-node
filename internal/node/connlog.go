@@ -163,6 +163,16 @@ type connSource struct {
 	at time.Time
 }
 
+// trackedConn remembers one just-started connection so a later sniff line can
+// move that single observation from its IP target onto the real domain. A
+// connection logs its destination before the router sniffs it, so the move is
+// the only way to name the destination without changing core behaviour.
+type trackedConn struct {
+	key      connKey
+	sourceIP string
+	at       int64
+}
+
 // ConnLog aggregates authenticated connections seen in the core log.
 //
 // The design is best effort by intent: observations are in-memory only, a slow
@@ -185,6 +195,7 @@ type ConnLog struct {
 	mu         sync.Mutex
 	keys       map[connKey]connValue
 	sources    map[uint32]connSource
+	tracked    map[uint32]trackedConn
 	pending    []ConnBatch
 	dropped    int64
 	probing    bool
@@ -196,7 +207,7 @@ type ConnLog struct {
 // connection log has no tunables an operator could safely change: the batch
 // size, key bound and probe interval come from the panel contract itself.
 func NewConnLog() *ConnLog {
-	return &ConnLog{keys: map[connKey]connValue{}, sources: map[uint32]connSource{}}
+	return &ConnLog{keys: map[connKey]connValue{}, sources: map[uint32]connSource{}, tracked: map[uint32]trackedConn{}}
 }
 
 func (c *ConnLog) nowTime() time.Time {
@@ -227,6 +238,22 @@ func (c *ConnLog) OnLine(line []byte) {
 	if !ok {
 		return
 	}
+	if parsed.level == logLevelDebug {
+		// Debug lines matter only for sniffed domains when the panel asks the
+		// core to run at debug level; every other debug record is ignored.
+		domain, ok := parseSniffDomain(parsed)
+		if !ok {
+			return
+		}
+		now := c.nowTime()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.probing && now.Before(c.probeUntil) {
+			return
+		}
+		c.moveLocked(parsed.id, domain)
+		return
+	}
 	event, ok := parseConnEvent(parsed)
 	if !ok {
 		return
@@ -249,15 +276,79 @@ func (c *ConnLog) OnLine(line []byte) {
 		}
 		source := c.takeSourceLocked(event.id, now)
 		at := now.Unix()
-		c.addLocked(connKey{
+		key := connKey{
 			userID:   userID,
 			nodeID:   nodeID,
 			hour:     at - at%connSecondsPerHour,
 			target:   event.addr,
 			sourceIP: source,
 			udp:      event.udp,
-		}, at)
+		}
+		c.addLocked(key, at)
+		c.trackLocked(event.id, trackedConn{key: key, sourceIP: source, at: at})
 	}
+}
+
+// trackLocked keeps one observation addressable by its connection ID so a later
+// sniff line can move it. The bound mirrors the source table: when it is full the
+// line stays attributed to its IP destination, which is still truthful.
+func (c *ConnLog) trackLocked(id uint32, conn trackedConn) {
+	if len(c.tracked) >= maxConnSources {
+		return
+	}
+	c.tracked[id] = conn
+}
+
+// moveLocked re-attributes one connection from its IP target to the domain the
+// core sniffed out of the TLS ClientHello or HTTP Host. The hour, user, node,
+// source address and network stay identical, so only the target dimension moves.
+func (c *ConnLog) moveLocked(id uint32, domain string) {
+	conn, found := c.tracked[id]
+	if !found {
+		return
+	}
+	delete(c.tracked, id)
+	host, port, err := net.SplitHostPort(conn.key.target)
+	if err != nil {
+		return
+	}
+	// A client that already sent a domain needs no move; the sniffed domain
+	// would only repeat it (and may differ in case).
+	if net.ParseIP(host) == nil {
+		return
+	}
+	target, ok := normalizeConnTarget(net.JoinHostPort(strings.ToLower(domain), port))
+	if !ok || target == conn.key.target {
+		return
+	}
+	if value, present := c.keys[conn.key]; present {
+		if value.count <= 1 {
+			delete(c.keys, conn.key)
+		} else {
+			value.count--
+			c.keys[conn.key] = value
+		}
+	}
+	next := conn.key
+	next.target = target
+	value, present := c.keys[next]
+	if !present {
+		if len(c.keys) >= maxConnKeys {
+			c.dropped++
+			return
+		}
+		value = connValue{firstAt: conn.at, lastAt: conn.at}
+	}
+	if value.count < maxConnCount {
+		value.count++
+	}
+	if conn.at < value.firstAt {
+		value.firstAt = conn.at
+	}
+	if conn.at > value.lastAt {
+		value.lastAt = conn.at
+	}
+	c.keys[next] = value
 }
 
 func (c *ConnLog) labelsLocked() map[string]TrafficLabel {
@@ -323,6 +414,16 @@ func (c *ConnLog) pruneSourcesLocked(now time.Time) {
 	}
 }
 
+// pruneTrackedLocked forgets connections whose sniff line never arrived, so the
+// table stays proportional to in-flight connections rather than total traffic.
+func (c *ConnLog) pruneTrackedLocked(now time.Time) {
+	for id, conn := range c.tracked {
+		if now.Unix()-conn.at > int64(connSourceAge/time.Second) {
+			delete(c.tracked, id)
+		}
+	}
+}
+
 // Flush turns the current aggregates into immutable batches, then delivers every
 // queued batch in order. It is the only place that talks to the panel, so the
 // agent can run it on a plain periodic worker and still keep every state change
@@ -350,6 +451,7 @@ func (c *ConnLog) Flush(ctx context.Context, send ConnSender) error {
 		return nil
 	}
 	c.pruneSourcesLocked(now)
+	c.pruneTrackedLocked(now)
 	if dropped := c.dropped; dropped > 0 {
 		c.dropped = 0
 		c.logf("connections: dropped %d buckets above the %d-key limit", dropped, maxConnKeys)
@@ -411,6 +513,7 @@ func (c *ConnLog) enterProbe(err error) {
 	defer c.mu.Unlock()
 	c.keys = map[connKey]connValue{}
 	c.sources = map[uint32]connSource{}
+	c.tracked = map[uint32]trackedConn{}
 	c.pending = nil
 	c.dropped = 0
 	c.probing = true
@@ -507,25 +610,38 @@ var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*[A-Za-z]")
 // 2006-01-02 15:04:05" layout.
 var logTimestampPrefix = regexp.MustCompile(`^[+-][0-9]{4} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} `)
 
-// coreLine is one decoded sing-box record: the connection ID shared by both
-// lines of a connection, the inbound logger tag and the message text.
+const (
+	logLevelInfo  = "INFO"
+	logLevelDebug = "DEBUG"
+)
+
+// coreLine is one decoded sing-box record: its level, the connection ID shared by
+// every line of a connection, and the remaining text (logger tag plus message).
 type coreLine struct {
-	id  uint32
-	tag string
-	msg string
+	level string
+	id    uint32
+	body  string
 }
 
-// parseCoreLine decodes `INFO[<seconds>] [<id> <duration>] <tag>: <message>`,
+// parseCoreLine decodes `LEVEL[<seconds>] [<id> <duration>] <tag>: <message>`,
 // tolerating the optional full timestamp and the ANSI colours logrusorgru/aurora
-// keeps on a pipe. It is a pure function so the format can be verified against
-// recorded core output without any process or panel.
+// keeps on a pipe. INFO carries connection records; DEBUG carries the sniffed
+// domain when the panel asks the core to log at debug level. It is a pure
+// function so the format can be verified against recorded core output.
 func parseCoreLine(line []byte) (coreLine, bool) {
 	text := strings.TrimRight(ansiEscape.ReplaceAllString(string(line), ""), "\r\n")
 	text = logTimestampPrefix.ReplaceAllString(text, "")
-	if !strings.HasPrefix(text, "INFO") {
+	var level string
+	switch {
+	case strings.HasPrefix(text, logLevelInfo):
+		level = logLevelInfo
+		text = text[len(logLevelInfo):]
+	case strings.HasPrefix(text, logLevelDebug):
+		level = logLevelDebug
+		text = text[len(logLevelDebug):]
+	default:
 		return coreLine{}, false
 	}
-	text = text[len("INFO"):]
 	if strings.HasPrefix(text, "[") {
 		// Non-timestamped form: INFO[0001] seconds since start.
 		end := strings.IndexByte(text, ']')
@@ -558,17 +674,10 @@ func parseCoreLine(line []byte) (coreLine, bool) {
 		return coreLine{}, false
 	}
 	text = text[1:]
-	// The tag may contain colons (mb:n:21) but never ": ", so the first ": "
-	// separates the inbound logger tag from the message.
-	separator := strings.Index(text, ": ")
-	if separator <= 0 {
+	if text == "" {
 		return coreLine{}, false
 	}
-	tag, msg := text[:separator], text[separator+2:]
-	if msg == "" {
-		return coreLine{}, false
-	}
-	return coreLine{id: uint32(id), tag: tag, msg: msg}, true
+	return coreLine{level: level, id: uint32(id), body: text}, true
 }
 
 func allDigits(s string) bool {
@@ -605,7 +714,20 @@ type connEvent struct {
 // user as a "[user]" prefix; the user may itself contain colons, so the prefix
 // ends at the first "]".
 func parseConnEvent(line coreLine) (connEvent, bool) {
-	msg, user := line.msg, ""
+	if line.level != logLevelInfo {
+		return connEvent{}, false
+	}
+	// The logger tag may contain colons (mb:n:21) but never ": ", so the first
+	// ": " separates it from the message.
+	separator := strings.Index(line.body, ": ")
+	if separator <= 0 {
+		return connEvent{}, false
+	}
+	tag, msg := line.body[:separator], line.body[separator+2:]
+	if msg == "" {
+		return connEvent{}, false
+	}
+	user := ""
 	if strings.HasPrefix(msg, "[") {
 		end := strings.IndexByte(msg, ']')
 		if end < 2 {
@@ -618,7 +740,7 @@ func parseConnEvent(line coreLine) (connEvent, bool) {
 		}
 		msg = rest[1:]
 	}
-	event := connEvent{id: line.id, tag: line.tag, user: user}
+	event := connEvent{id: line.id, tag: tag, user: user}
 	var rest string
 	switch {
 	case strings.HasPrefix(msg, "inbound packet connection from "):
@@ -648,6 +770,40 @@ func parseConnEvent(line coreLine) (connEvent, bool) {
 	}
 	event.addr = target
 	return event, true
+}
+
+// sniffedDomainPattern matches the domain field of a sniff record regardless of
+// which optional fields follow it.
+var sniffedDomainPattern = regexp.MustCompile(`(?:^|, )domain: ([^,]+)`)
+
+// parseSniffDomain extracts the sniffed domain from a debug line. The router
+// logger tags the record ("router: sniffed protocol: tls, domain: x"), so the
+// message is located first and then read.
+func parseSniffDomain(line coreLine) (string, bool) {
+	if line.level != logLevelDebug {
+		return "", false
+	}
+	body := line.body
+	index := strings.Index(body, "sniffed protocol: ")
+	if index < 0 {
+		index = strings.Index(body, "sniffed packet protocol: ")
+	}
+	if index < 0 {
+		return "", false
+	}
+	// Only a logger tag may precede the message; anything else is a different record.
+	if index > 0 && !strings.HasSuffix(body[:index], ": ") {
+		return "", false
+	}
+	match := sniffedDomainPattern.FindStringSubmatch(body[index:])
+	if match == nil {
+		return "", false
+	}
+	domain := strings.TrimSpace(match[1])
+	if domain == "" {
+		return "", false
+	}
+	return domain, true
 }
 
 // normalizeConnSource reduces a logged client address to a canonical IP string,

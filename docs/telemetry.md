@@ -1,6 +1,14 @@
 # Automatic telemetry contract and production deployment
 
 ## Connection log (agent 0.3.0)
+The 0.4.0 agent also honours the panel's SNI sniff switch. A machine with the
+switch on is compiled with `log.level: debug` and a `sniff` route action, so the
+core logs `DEBUG ... router: sniffed protocol: tls, domain: <name>` right after
+the connection starts. The agent re-attributes that single observation from the
+IP destination to `domain:port`; the hour, user, node, source address and
+network stay identical. Sniffing never rewrites the destination, so routing
+behaviour is unchanged. Debug lines are the only source of the sniffed name:
+at the default info level the record shows the address the client asked for.
 
 0.3.0 adds an observation layer beside billing; it does not change the config envelope, `traffic_labels`, the journal, the spool or any heartbeat field, so a 0.3.0 agent reads a 0.2.2 journal and spool in place and a 0.2.2 agent simply stops reporting connections.
 

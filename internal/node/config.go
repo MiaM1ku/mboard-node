@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 const MaxBody = 1 << 20
 const MaxSafeInteger int64 = 9007199254740991
 
