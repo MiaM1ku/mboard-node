@@ -159,8 +159,23 @@ type connValue struct {
 }
 
 type connSource struct {
-	ip string
-	at time.Time
+	ip   string
+	port string
+	at   time.Time
+}
+
+// peerKey identifies one client socket on one inbound. The domain traffic poller
+// uses it to attribute a Clash API connection, which carries no user, to the
+// authenticated user the core log named for the same socket.
+type peerKey struct {
+	tag  string
+	addr string
+}
+
+type peerIdentity struct {
+	userID int64
+	nodeID int64
+	seen   time.Time
 }
 
 // trackedConn remembers one just-started connection so a later sniff line can
@@ -196,6 +211,7 @@ type ConnLog struct {
 	keys       map[connKey]connValue
 	sources    map[uint32]connSource
 	tracked    map[uint32]trackedConn
+	peers      map[peerKey]peerIdentity
 	pending    []ConnBatch
 	dropped    int64
 	probing    bool
@@ -207,7 +223,7 @@ type ConnLog struct {
 // connection log has no tunables an operator could safely change: the batch
 // size, key bound and probe interval come from the panel contract itself.
 func NewConnLog() *ConnLog {
-	return &ConnLog{keys: map[connKey]connValue{}, sources: map[uint32]connSource{}, tracked: map[uint32]trackedConn{}}
+	return &ConnLog{keys: map[connKey]connValue{}, sources: map[uint32]connSource{}, tracked: map[uint32]trackedConn{}, peers: map[peerKey]peerIdentity{}}
 }
 
 func (c *ConnLog) nowTime() time.Time {
@@ -268,13 +284,14 @@ func (c *ConnLog) OnLine(line []byte) {
 	}
 	switch event.kind {
 	case connEventSource:
-		c.rememberSourceLocked(event.id, event.addr, now)
+		c.rememberSourceLocked(event.id, event.addr, event.port, now)
 	case connEventDestination:
 		userID, nodeID, ok := resolveConnIdentity(c.labelsLocked(), event.tag, event.user)
 		if !ok {
 			return
 		}
-		source := c.takeSourceLocked(event.id, now)
+		source, sourcePort := c.takeSourceLocked(event.id, now)
+		c.rememberPeerLocked(event.tag, source, sourcePort, userID, nodeID, now)
 		at := now.Unix()
 		key := connKey{
 			userID:   userID,
@@ -379,7 +396,7 @@ func (c *ConnLog) addLocked(key connKey, at int64) {
 	c.keys[key] = value
 }
 
-func (c *ConnLog) rememberSourceLocked(id uint32, ip string, now time.Time) {
+func (c *ConnLog) rememberSourceLocked(id uint32, ip, port string, now time.Time) {
 	if ip == "" {
 		return
 	}
@@ -391,19 +408,67 @@ func (c *ConnLog) rememberSourceLocked(id uint32, ip string, now time.Time) {
 			c.sources = map[uint32]connSource{}
 		}
 	}
-	c.sources[id] = connSource{ip: ip, at: now}
+	c.sources[id] = connSource{ip: ip, port: port, at: now}
 }
 
-func (c *ConnLog) takeSourceLocked(id uint32, now time.Time) string {
+func (c *ConnLog) takeSourceLocked(id uint32, now time.Time) (string, string) {
 	source, found := c.sources[id]
 	if !found {
-		return ""
+		return "", ""
 	}
 	delete(c.sources, id)
 	if now.Sub(source.at) > connSourceAge {
-		return ""
+		return "", ""
 	}
-	return source.ip
+	return source.ip, source.port
+}
+
+// rememberPeerLocked records which authenticated user owns one client socket.
+// When the table is full new sockets stay unattributed, which only costs the
+// domain statistics of those connections and never touches billing.
+func (c *ConnLog) rememberPeerLocked(tag, ip, port string, userID, nodeID int64, now time.Time) {
+	name, ok := inboundTagName(tag)
+	if !ok || ip == "" || port == "" {
+		return
+	}
+	key := peerKey{tag: name, addr: net.JoinHostPort(ip, port)}
+	if _, known := c.peers[key]; !known && len(c.peers) >= maxConnSources {
+		return
+	}
+	c.peers[key] = peerIdentity{userID: userID, nodeID: nodeID, seen: now}
+}
+
+// IdentityFor resolves a live socket to its user and node. tag is the inbound tag
+// without the protocol type; ip may be any textual form of the client address.
+func (c *ConnLog) IdentityFor(tag, ip, port string) (int64, int64, bool) {
+	normalized, ok := normalizeConnSource(ip)
+	if !ok {
+		return 0, 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	peer, found := c.peers[peerKey{tag: tag, addr: net.JoinHostPort(normalized, port)}]
+	if !found {
+		return 0, 0, false
+	}
+	return peer.userID, peer.nodeID, true
+}
+
+// RefreshPeers marks the sockets still present in the latest Clash snapshot and
+// forgets the ones that have been gone for longer than connSourceAge. A long
+// lived connection therefore keeps its identity for as long as it exists.
+func (c *ConnLog) RefreshPeers(live map[peerKey]struct{}) {
+	now := c.nowTime()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, peer := range c.peers {
+		if _, present := live[key]; present {
+			peer.seen = now
+			c.peers[key] = peer
+		} else if now.Sub(peer.seen) > connSourceAge {
+			delete(c.peers, key)
+		}
+	}
 }
 
 func (c *ConnLog) pruneSourcesLocked(now time.Time) {
@@ -707,6 +772,7 @@ type connEvent struct {
 	kind connEventKind
 	user string
 	addr string
+	port string
 	udp  bool
 }
 
@@ -761,6 +827,9 @@ func parseConnEvent(line coreLine) (connEvent, bool) {
 	if event.kind == connEventSource {
 		if ip, ok := normalizeConnSource(rest); ok {
 			event.addr = ip
+			if _, port, err := net.SplitHostPort(rest); err == nil {
+				event.port = port
+			}
 		}
 		return event, true
 	}

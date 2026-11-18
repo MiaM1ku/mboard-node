@@ -237,3 +237,26 @@ func (c *Client) Connections(ctx context.Context, b ConnBatch) error {
 	}
 	return nil
 }
+
+// DomainTraffic posts one aggregated per-domain byte batch; the receipt check
+// mirrors Connections.
+func (c *Client) DomainTraffic(ctx context.Context, b DomainBatch) error {
+	if err := b.Validate(); err != nil {
+		return err
+	}
+	var out struct {
+		Accepted bool  `json:"accepted"`
+		Stored   int64 `json:"stored"`
+		Skipped  int64 `json:"skipped"`
+	}
+	if err := c.request(ctx, http.MethodPost, "/api/node/v1/domain-traffic", b, &out); err != nil {
+		return err
+	}
+	if !out.Accepted {
+		return errors.New("panel did not acknowledge domain traffic batch")
+	}
+	if out.Stored < 0 || out.Skipped < 0 {
+		return errors.New("invalid domain traffic receipt")
+	}
+	return nil
+}

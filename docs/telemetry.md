@@ -39,6 +39,25 @@ Memory bounds, all in memory and never on disk: 20000 aggregation buckets (furth
 
 Privacy scope: records contain the authenticated user, the entry node, the destination host and port, the client IP address, the network and the count. They contain no payload, no username/password, no TLS SNI beyond the destination, and no DNS query names that were hijacked locally. The panel keeps them for 7 days. Operators who do not want destination logging on disk set `connection_log:"off"`, which also restores the 0.2.2 start path where the child's stderr is discarded.
 
+## Domain traffic (agent 0.5.0)
+Adds bytes per destination domain beside the connection counts. It is observation only: billing, the journal and the spool are untouched, and a 0.4.0 agent simply never reports it.
+
+Data source: sing-box's Clash API `GET /connections`, which lists every live connection with cumulative `upload`/`download`, the host the client asked for (or the sniffed domain), `type` (`<protocol>/<inbound tag>`) and the client `sourceIP:sourcePort`. It names no user, so the agent joins it with the core log: the connection log already learns the authenticated user of each client socket from the `inbound connection from` / `[user] inbound connection to` pair, and keeps `(inbound tag, client ip:port) -> (user_id, node_id)`. A Clash connection with the same tag and source socket belongs to that user.
+
+Every 2 seconds the agent polls the loopback controller, takes the growth of each connection's counters since the previous poll and adds it to `(user_id, node_id, UTC hour, domain)`. `domain` is the registrable domain (public suffix list, so `a.googlevideo.com` and `b.googlevideo.com` merge, ports dropped); a client that connected by IP keeps the literal address. Enable SNI sniff as well, otherwise clients that connect by IP are only ever attributed to the IP.
+
+The controller is enabled per machine by the panel (`experimental.clash_api` on `127.0.0.1:19091` with a stable random secret). The agent only talks to a literal loopback controller and stays idle when the config has none. **The core must be built with `with_clash_api`**, otherwise `sing-box check` rejects the config and the revision is rolled back.
+
+Delivery mirrors the connection log: one batch per minute (max 2000 records, random `batch_id`) to `POST /api/node/v1/domain-traffic`
+
+```json
+{"batch_id":"<id>","records":[{"user_id":7,"node_id":21,"hour":1762819200,"domain":"googlevideo.com","upload_bytes":1200,"download_bytes":52428800}]}
+```
+
+answered with `{"data":{"accepted":true,"stored":N,"skipped":M}}`. The same queue, retry, `404/405` probe pause and permanent-error rules apply. Memory bounds: 20000 aggregation buckets, 10 queued batches.
+
+Accuracy: best effort. A connection that lives less than one poll interval, or the last <2 seconds of a closing connection, is missed, and a core restart loses at most the current minute. Totals therefore sit slightly below billed traffic. The panel keeps the rows for 35 days (a monthly report needs the previous calendar month) and uses them for the connection log's domain table and the report's "most used domain" per user.
+
 ## Delivery quarantine (agent 0.2.2)
 
 0.2.2 changes only how queued traffic batches leave the node; the config, `traffic_labels` and journal formats are unchanged, so a 0.2.2 agent reads a 0.2.1 journal and spool in place. Field case that forced it: an administrator deleted users on 2026-10-15. Each node still had one last batch for those users in `spool/`, the panel answered `403 TRAFFIC_GRANT` for the whole batch, and the pre-0.2.2 loop returned without removing the file. That batch stayed at the head of the queue, the spool filled to its 10,000-batch limit, the collector stopped publishing, `telemetry_ready` went to 0, and the nodes dropped out of subscriptions while still heartbeating. Two machines were affected before it was found.
@@ -76,7 +95,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
 /tmp/mboard-core-build/sing-box check -c /secure/staged/native.json
 ```
 
-Minimal tags for VLESS Reality, SS2022, Trojan TLS, AnyTLS and stats: `with_v2ray_api,with_utls`. **Reality server requires `with_utls`.** `with_quic` enables QUIC protocols/transports. `with_grpc` selects standard gRPC transport instead of the lite implementation; V2Ray stats gRPC itself doesn't require it. ECH is provided by stdlib in this version: **do not pass `with_ech`**, because its deprecated-tag stub intentionally fails compilation. `with_clash_api` is optional and provides no authenticated per-user billing. Build/check the actual complete config rather than reducing its routes or outbounds to a synthetic subset.
+Minimal tags for VLESS Reality, SS2022, Trojan TLS, AnyTLS and stats: `with_v2ray_api,with_utls`. **Reality server requires `with_utls`.** `with_quic` enables QUIC protocols/transports. `with_grpc` selects standard gRPC transport instead of the lite implementation; V2Ray stats gRPC itself doesn't require it. ECH is provided by stdlib in this version: **do not pass `with_ech`**, because its deprecated-tag stub intentionally fails compilation. `with_clash_api` is required only for domain traffic (agent 0.5.0); it provides no authenticated per-user billing, the agent derives the user from the core log. Build/check the actual complete config rather than reducing its routes or outbounds to a synthetic subset.
 
 ## Backend config envelope
 

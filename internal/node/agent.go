@@ -109,11 +109,18 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 	// core's stderr, never touches the journal, spool or counters, and can be
 	// switched off so the start path is byte-for-byte the previous release.
 	var connLog *ConnLog
+	var domains *DomainTraffic
 	if c.ConnectionLogEnabled() {
 		connLog = NewConnLog()
 		connLog.Labels = manager.Labels
 		connLog.Log = logger.Printf
 		core.OnLine = connLog.OnLine
+		// Domain bytes need the user attribution the connection log builds, so the
+		// poller only exists beside it and idles until the core exposes clash_api.
+		domains = NewDomainTraffic()
+		domains.Spec = manager.Spec
+		domains.Peers = connLog
+		domains.Log = logger.Printf
 	}
 	interval, _ := time.ParseDuration(c.Interval)
 	started := time.Now()
@@ -150,6 +157,8 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 		// One minute of aggregation keeps POSTs cheap while the panel still sees
 		// hour buckets appear promptly.
 		start("connections", time.Minute, func(ctx context.Context) error { return connLog.Flush(ctx, client) })
+		start("domain-poll", 2*time.Second, func(ctx context.Context) error { return domains.Poll(ctx) })
+		start("domain-traffic", time.Minute, func(ctx context.Context) error { return domains.Flush(ctx, client) })
 	}
 	logger.Print("agent started; machine token [REDACTED]")
 	<-ctx.Done()
@@ -167,6 +176,9 @@ func Run(ctx context.Context, c Config, out io.Writer) error {
 		flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := connLog.Flush(flushCtx, client); err != nil {
 			logger.Printf("shutdown connection flush: %v", err)
+		}
+		if err := domains.Flush(flushCtx, client); err != nil {
+			logger.Printf("shutdown domain traffic flush: %v", err)
 		}
 		flushCancel()
 	}

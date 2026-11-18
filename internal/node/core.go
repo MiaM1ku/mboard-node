@@ -221,6 +221,7 @@ type Manager struct {
 	// guarded by the lifecycle lock (which would serialize log parsing behind
 	// config application and core restarts).
 	labels         atomic.Pointer[map[string]TrafficLabel]
+	specSnap       atomic.Pointer[TelemetrySpec]
 	activeSHA      string
 	BeforeRestart  func(context.Context, TelemetrySpec, string) error
 	BeforeRollback func(context.Context, TelemetrySpec, string) error
@@ -241,6 +242,16 @@ func (m *Manager) setSpec(spec TelemetrySpec) {
 		labels = map[string]TrafficLabel{}
 	}
 	m.labels.Store(&labels)
+	snapshot := spec
+	m.specSnap.Store(&snapshot)
+}
+
+// Spec returns the telemetry spec the running core was started from.
+func (m *Manager) Spec() TelemetrySpec {
+	if snapshot := m.specSnap.Load(); snapshot != nil {
+		return *snapshot
+	}
+	return TelemetrySpec{}
 }
 
 // Labels returns the accounting mapping of the current core generation. It is

@@ -61,9 +61,45 @@ func mappedTrafficLabel(label TrafficLabel) (TrafficLabel, error) {
 type TelemetrySpec struct {
 	Address string
 	Labels  map[string]TrafficLabel
+	// ClashAddress and ClashSecret locate the optional loopback Clash API the
+	// domain traffic poller reads. Empty means the feature is off for this core.
+	ClashAddress string
+	ClashSecret  string
+}
+
+// clashEndpoint reads experimental.clash_api. Anything that is not a literal
+// loopback address is ignored: the poller must never be pointed at a remote host.
+func clashEndpoint(raw []byte) (string, string) {
+	var native struct {
+		Experimental struct {
+			ClashAPI struct {
+				Controller string `json:"external_controller"`
+				Secret     string `json:"secret"`
+			} `json:"clash_api"`
+		} `json:"experimental"`
+	}
+	if json.Unmarshal(raw, &native) != nil {
+		return "", ""
+	}
+	api := native.Experimental.ClashAPI
+	host, port, err := net.SplitHostPort(api.Controller)
+	ip := net.ParseIP(host)
+	p, e := strconv.Atoi(port)
+	if err != nil || e != nil || ip == nil || !ip.IsLoopback() || p < 1 || p > 65535 || len(api.Secret) > 512 {
+		return "", ""
+	}
+	return api.Controller, api.Secret
 }
 
 func telemetrySpec(raw []byte, labels []TrafficLabel) (TelemetrySpec, error) {
+	spec, err := stateSpec(raw, labels)
+	if err == nil {
+		spec.ClashAddress, spec.ClashSecret = clashEndpoint(raw)
+	}
+	return spec, err
+}
+
+func stateSpec(raw []byte, labels []TrafficLabel) (TelemetrySpec, error) {
 	var native struct {
 		Experimental struct {
 			V2RayAPI struct {
